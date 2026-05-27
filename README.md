@@ -32,6 +32,20 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+If TIF loading fails because `rasterio` is missing, install it in the same
+environment:
+
+```bash
+python -m pip install rasterio
+```
+
+For conda-based Jupyter images, `conda-forge` is often more reliable because it
+installs GDAL-compatible binary dependencies:
+
+```bash
+conda install -c conda-forge rasterio
+```
+
 ## CUDA Check
 
 If `nvidia-smi` shows a GPU but training says CUDA is unavailable, the active
