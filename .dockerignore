@@ -1,0 +1,16 @@
+.git
+__pycache__
+*.pyc
+.venv
+venv
+data
+dataset
+runs
+outputs
+checkpoints
+.cache
+.pytest_cache
+wandb
+*.pt
+*.pth
+*.ckpt
