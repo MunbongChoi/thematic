@@ -25,8 +25,11 @@ mapping is inferred from the GeoJSON tile bounds.
 
 ## Install
 
-```powershell
-pip install -r requirements.txt
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
 ## Writable Output Directory
@@ -48,13 +51,13 @@ python train.py --architecture segformer
 
 ## Train with Hugging Face SegFormer
 
-```powershell
+```bash
 python train.py --architecture segformer --epochs 20 --batch-size 4 --image-size 512
 ```
 
 Use `--target-ann-codes` to change which `ANN_CD` values are treated as road:
 
-```powershell
+```bash
 python train.py --architecture segformer --target-ann-codes 30
 ```
 
@@ -63,13 +66,13 @@ Its segmentation head is resized to two labels: `background` and `road`.
 
 ## Train with local UNet
 
-```powershell
+```bash
 python train.py --architecture unet --epochs 50 --batch-size 8 --image-size 512
 ```
 
 ## Train with YOLO segmentation
 
-```powershell
+```bash
 python train.py --architecture yolo --model-name-or-path yolo11n-seg.pt --epochs 50 --batch-size 8 --image-size 640
 ```
 
@@ -79,7 +82,7 @@ The best checkpoint is copied to `runs/road_extraction/best_yolo.pt`.
 
 ## Train with Mask2Former panoptic segmentation
 
-```powershell
+```bash
 python train.py --architecture mask2former --output-dir runs/panoptic_segmentation --epochs 20 --batch-size 2 --image-size 512
 ```
 
@@ -89,13 +92,13 @@ building instances, and the remaining classes are treated as stuff classes.
 
 To export COCO-style panoptic annotations without training:
 
-```powershell
+```bash
 python train.py --architecture mask2former --export-panoptic-only --limit 10 --panoptic-data-dir outputs/panoptic_dataset
 ```
 
 ## Evaluate
 
-```powershell
+```bash
 python test.py --checkpoint runs/road_extraction/best_model.pt
 python test.py --architecture yolo --checkpoint runs/road_extraction/best_yolo.pt --image-size 640
 python test.py --architecture mask2former --checkpoint runs/panoptic_segmentation/best_mask2former.pt --image-size 512
@@ -110,7 +113,7 @@ one of `best_model.pt`, `best_sam.pt`, `best_mask2former.pt`,
 
 ## Inference
 
-```powershell
+```bash
 python infer.py --checkpoint runs/road_extraction/best_model.pt --input infer_data --output-dir outputs/infer
 python infer.py --architecture yolo --checkpoint runs/road_extraction/best_yolo.pt --input infer_data --output-dir outputs/yolo_infer --image-size 640
 python infer.py --architecture mask2former --checkpoint runs/panoptic_segmentation/best_mask2former.pt --input infer_data --output-dir outputs/panoptic_infer --image-size 512

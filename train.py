@@ -469,13 +469,13 @@ def train_yolo(args: argparse.Namespace) -> None:
 
     model = build_yolo_model(model_name)
     train_kwargs = {
-        "data": str(data_yaml),
+        "data": str(data_yaml.resolve()),
         "task": "segment",
         "imgsz": args.image_size,
         "epochs": args.epochs,
         "batch": args.batch_size,
         "lr0": args.lr,
-        "project": str(output_dir),
+        "project": str(output_dir.resolve()),
         "name": "yolo",
         "exist_ok": True,
         "workers": args.num_workers,
@@ -483,10 +483,20 @@ def train_yolo(args: argparse.Namespace) -> None:
     if args.device:
         train_kwargs["device"] = args.device
     results = model.train(**train_kwargs)
-    best_path = output_dir / "yolo" / "weights" / "best.pt"
-    if best_path.exists():
-        shutil.copy2(best_path, output_dir / "best_yolo.pt")
-    print(results)
+    best_candidates = [output_dir / "yolo" / "weights" / "best.pt"]
+    save_dir = getattr(results, "save_dir", None) or getattr(getattr(model, "trainer", None), "save_dir", None)
+    if save_dir is not None:
+        best_candidates.insert(0, Path(save_dir) / "weights" / "best.pt")
+    for best_path in best_candidates:
+        if best_path.exists():
+            shutil.copy2(best_path, output_dir / "best_yolo.pt")
+            break
+    else:
+        searched = ", ".join(str(path) for path in best_candidates)
+        raise FileNotFoundError(f"YOLO training finished but best.pt was not found. Searched: {searched}")
+
+    result_dict = getattr(results, "results_dict", None)
+    print(json.dumps(result_dict, indent=2) if result_dict else results)
 
 
 def write_panoptic_split(samples: list[tuple[Path, Path]], split_name: str, output_root: Path) -> dict[str, object]:
