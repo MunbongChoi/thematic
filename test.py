@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a road extraction checkpoint.")
     parser.add_argument("--checkpoint", default="runs/road_extraction/best_model.pt")
     parser.add_argument("--dataset-root", default="dataset")
-    parser.add_argument("--architecture", default="auto", choices=["auto", "segformer", "unet", "yolo", "mask2former"])
+    parser.add_argument("--architecture", default="auto", type=str.lower, choices=["auto", "segformer", "unet", "yolo", "mask2former"])
     parser.add_argument("--split", default="valid", choices=["train", "valid"])
     parser.add_argument("--image-size", type=int, default=512, help="Required for YOLO evaluation.")
     parser.add_argument("--batch-size", type=int, default=4)
@@ -194,6 +194,8 @@ def main() -> None:
         raise
 
     architecture = checkpoint["architecture"]
+    if args.architecture != "auto" and args.architecture != architecture:
+        raise ValueError(f"Checkpoint architecture is {architecture!r}, but --architecture={args.architecture!r}.")
     if architecture == "mask2former":
         evaluate_panoptic(args, model, checkpoint)
         return
@@ -204,7 +206,13 @@ def main() -> None:
     split_dir = dataset_root / args.split
     if args.split == "valid" and not ((split_dir / "image").exists() and (split_dir / "label").exists()):
         full_dataset = RoadSegmentationDataset(dataset_root / "train", image_size, args.limit, target_ann_codes)
+        if not 0.0 < args.val_ratio < 1.0:
+            raise ValueError("--val-ratio must be between 0 and 1.")
+        if len(full_dataset) < 2:
+            raise ValueError("At least two training samples are required when dataset/valid is unavailable.")
         val_size = max(1, int(len(full_dataset) * args.val_ratio))
+        if val_size >= len(full_dataset):
+            val_size = len(full_dataset) - 1
         train_size = len(full_dataset) - val_size
         _, dataset = random_split(
             full_dataset,

@@ -79,7 +79,7 @@ def segment_infos_to_json(segments_info: Iterable[SegmentInfo]) -> list[dict[str
 def validate_label_crs(data: dict, label_path: Path) -> None:
     crs = data.get("crs")
     if not crs:
-        return
+        raise PanopticLabelError(f"{label_path} is missing CRS metadata. Expected EPSG:{LABEL_CRS_EPSG} for geometry labels.")
     name = str(crs.get("properties", {}).get("name", ""))
     if f"EPSG::{LABEL_CRS_EPSG}" not in name and f"EPSG:{LABEL_CRS_EPSG}" not in name:
         raise PanopticLabelError(f"{label_path} CRS must be EPSG:{LABEL_CRS_EPSG}, got {name!r}.")

@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# This Windows environment fails OpenMP initialization when torch is loaded
+# before numpy, while the training/inference entrypoints already load numpy first.
+import numpy as np  # noqa: F401
 import torch
 from torch import nn
 
@@ -38,9 +41,22 @@ def resolve_torch_device(device: str | None = None) -> torch.device:
         first_device = normalized.split(",", maxsplit=1)[0].strip()
         normalized = first_device
     if normalized.isdigit():
-        return torch.device(f"cuda:{normalized}")
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device {normalized!r} was requested, but CUDA is not available.")
+        index = int(normalized)
+        if index >= torch.cuda.device_count():
+            raise RuntimeError(f"CUDA device index {index} is unavailable. Found {torch.cuda.device_count()} CUDA device(s).")
+        return torch.device(f"cuda:{index}")
     if normalized == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested, but CUDA is not available.")
         return torch.device("cuda:0")
+    if normalized.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"{device!r} was requested, but CUDA is not available.")
+        index = int(normalized.split(":", maxsplit=1)[1])
+        if index >= torch.cuda.device_count():
+            raise RuntimeError(f"CUDA device index {index} is unavailable. Found {torch.cuda.device_count()} CUDA device(s).")
     return torch.device(normalized)
 
 

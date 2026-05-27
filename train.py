@@ -17,12 +17,13 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 
-from config import DEFAULT_MODEL_NAME, NUM_CLASSES, OUTPUT_ROOT, PANOPTIC_DATASET_DIR, panoptic_categories_as_coco
+from config import DEFAULT_MODEL_NAME, LABEL_CRS_EPSG, NUM_CLASSES, OUTPUT_ROOT, PANOPTIC_DATASET_DIR, panoptic_categories_as_coco
 from model import DEFAULT_YOLO_SEG_MODEL, ModelConfig, build_model, build_yolo_model, resolve_torch_device, save_checkpoint
 from panoptic import (
     category_summary,
     masks_and_classes_from_panoptic,
     panoptic_id_to_rgb,
+    polygons_from_geometry,
     render_panoptic_label,
     segment_infos_to_json,
 )
@@ -32,6 +33,15 @@ IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 RASTER_SUFFIXES = {".tif", ".tiff"}
 DEFAULT_OUTPUT_DIR = os.environ.get("SATSEG_OUTPUT_DIR", "runs/road_extraction")
+SUPPORTED_TRAIN_ARCHITECTURES = ("segformer", "unet", "yolo", "mask2former")
+
+
+def normalize_architecture(value: str) -> str:
+    architecture = value.strip().lower()
+    if architecture not in SUPPORTED_TRAIN_ARCHITECTURES:
+        choices = ", ".join(SUPPORTED_TRAIN_ARCHITECTURES)
+        raise argparse.ArgumentTypeError(f"Unsupported architecture: {value!r}. Choose one of: {choices}")
+    return architecture
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,7 +52,13 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_DIR,
         help="Directory for checkpoints and metrics. Can also be set with SATSEG_OUTPUT_DIR.",
     )
-    parser.add_argument("--architecture", default="segformer", choices=["segformer", "unet", "yolo", "mask2former"], help="Model architecture.")
+    parser.add_argument(
+        "--architecture",
+        default="segformer",
+        type=normalize_architecture,
+        choices=SUPPORTED_TRAIN_ARCHITECTURES,
+        help="Model architecture.",
+    )
     parser.add_argument(
         "--model-name-or-path",
         default="nvidia/segformer-b0-finetuned-ade-512-512",
@@ -172,15 +188,24 @@ def image_size(image_path: Path) -> tuple[int, int]:
         return image.size
 
 
-def feature_is_target(feature: dict, target_ann_codes: set[int]) -> bool:
+def validate_label_crs(data: dict, label_path: Path) -> None:
+    crs = data.get("crs")
+    if not crs:
+        raise ValueError(f"{label_path} is missing CRS metadata. Expected EPSG:{LABEL_CRS_EPSG} for geometry labels.")
+    name = str(crs.get("properties", {}).get("name", ""))
+    if f"EPSG::{LABEL_CRS_EPSG}" not in name and f"EPSG:{LABEL_CRS_EPSG}" not in name:
+        raise ValueError(f"{label_path} CRS must be EPSG:{LABEL_CRS_EPSG}, got {name!r}.")
+
+
+def feature_is_target(feature: dict, target_ann_codes: set[int], label_path: Path, feature_idx: int) -> bool:
     properties = feature.get("properties", {})
     ann_cd = properties.get("ANN_CD")
     if ann_cd is None:
-        return True
+        raise ValueError(f"{label_path} feature {feature_idx} is missing ANN_CD; cannot select target class.")
     try:
         return int(ann_cd) in target_ann_codes
     except (TypeError, ValueError):
-        return False
+        raise ValueError(f"{label_path} feature {feature_idx} has invalid ANN_CD={ann_cd!r}.")
 
 
 def iter_polygon_rings(geometry: dict) -> Iterable[list[list[float]]]:
@@ -207,7 +232,7 @@ def label_bounds(data: dict) -> tuple[float, float, float, float]:
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def geo_to_pixel_transform(data: dict, size: tuple[int, int]) -> tuple[float, float, float, float]:
+def geo_to_pixel_transform(data: dict, size: tuple[int, int], label_path: Path) -> tuple[float, float, float, float]:
     """Return minx, maxy, x_res, y_res for labels stored in map coordinates.
 
     The changed dataset stores EPSG:5186 coordinates in JSON while the source TIF files
@@ -216,6 +241,7 @@ def geo_to_pixel_transform(data: dict, size: tuple[int, int]) -> tuple[float, fl
     image pixel space for supervised mask generation.
     """
 
+    validate_label_crs(data, label_path)
     width, height = size
     min_x, min_y, max_x, max_y = label_bounds(data)
     if max_x <= min_x or max_y <= min_y:
@@ -262,23 +288,12 @@ def road_polygons_from_label(
         raise ValueError(f"{label_path} uses geometry coordinates; image_size is required.")
 
     target_ann_codes = target_ann_codes or {30}
-    transform = geo_to_pixel_transform(data, image_size)
-    for feature in data.get("features", []):
-        if not feature_is_target(feature, target_ann_codes):
+    transform = geo_to_pixel_transform(data, image_size, label_path)
+    for feature_idx, feature in enumerate(data.get("features", []), start=1):
+        if not feature_is_target(feature, target_ann_codes, label_path, feature_idx):
             continue
-        geometry = feature.get("geometry", {})
-        geometry_type = geometry.get("type")
-        coordinates = geometry.get("coordinates", [])
-        if geometry_type == "Polygon":
-            polygons_to_read = [coordinates]
-        elif geometry_type == "MultiPolygon":
-            polygons_to_read = coordinates
-        else:
-            continue
-        for polygon in polygons_to_read:
-            if not polygon:
-                continue
-            exterior = geo_ring_to_pixels(polygon[0], transform, image_size)
+        for polygon in polygons_from_geometry(feature.get("geometry", {}), transform, image_size):
+            exterior = polygon[0]
             if len(exterior) >= 3:
                 polygons.append(exterior)
     return polygons
@@ -304,30 +319,18 @@ def rasterize_road_mask(label_path: Path, size: tuple[int, int], target_ann_code
     if has_pixel_coords:
         return mask
 
-    transform = geo_to_pixel_transform(data, size)
-    for feature in data.get("features", []):
-        if not feature_is_target(feature, target_ann_codes):
+    transform = geo_to_pixel_transform(data, size, label_path)
+    for feature_idx, feature in enumerate(data.get("features", []), start=1):
+        if not feature_is_target(feature, target_ann_codes, label_path, feature_idx):
             continue
-        geometry = feature.get("geometry", {})
-        geometry_type = geometry.get("type")
-        coordinates = geometry.get("coordinates", [])
-        if geometry_type == "Polygon":
-            polygons = [coordinates]
-        elif geometry_type == "MultiPolygon":
-            polygons = coordinates
-        else:
-            continue
-        for polygon in polygons:
-            if not polygon:
-                continue
-            exterior = geo_ring_to_pixels(polygon[0], transform, size)
+        for polygon in polygons_from_geometry(feature.get("geometry", {}), transform, size):
+            exterior = polygon[0]
             if len(exterior) < 3:
                 continue
             draw.polygon(exterior, fill=1)
             for hole in polygon[1:]:
-                interior = geo_ring_to_pixels(hole, transform, size)
-                if len(interior) >= 3:
-                    draw.polygon(interior, fill=0)
+                if len(hole) >= 3:
+                    draw.polygon(hole, fill=0)
     return mask
 
 
@@ -359,6 +362,8 @@ def find_image_for_label(image_dir: Path, label_path: Path, image_index: tuple[d
 
 
 def collect_samples(split_dir: Path, limit: int | None = None) -> list[tuple[Path, Path]]:
+    if limit is not None and limit <= 0:
+        raise ValueError("--limit must be a positive integer when provided.")
     image_dir = split_dir / "image"
     label_dir = split_dir / "label"
     if not image_dir.exists() or not label_dir.exists():
@@ -377,6 +382,8 @@ def collect_samples(split_dir: Path, limit: int | None = None) -> list[tuple[Pat
 
 
 def split_samples(args: argparse.Namespace) -> tuple[list[tuple[Path, Path]], list[tuple[Path, Path]]]:
+    if not 0.0 < args.val_ratio < 1.0:
+        raise ValueError("--val-ratio must be between 0 and 1.")
     dataset_root = Path(args.dataset_root)
     train_samples = collect_samples(dataset_root / "train", args.limit)
     valid_dir = dataset_root / "valid"
@@ -387,7 +394,11 @@ def split_samples(args: argparse.Namespace) -> tuple[list[tuple[Path, Path]], li
     rng = random.Random(args.seed)
     shuffled = train_samples[:]
     rng.shuffle(shuffled)
+    if len(shuffled) < 2:
+        raise ValueError("At least two training samples are required when dataset/valid is unavailable.")
     val_size = max(1, int(len(shuffled) * args.val_ratio))
+    if val_size >= len(shuffled):
+        val_size = len(shuffled) - 1
     return shuffled[val_size:], shuffled[:val_size]
 
 
@@ -584,7 +595,11 @@ def make_panoptic_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, Dat
     if has_valid:
         valid_dataset = PanopticSegmentationDataset(valid_dir, args.image_size, args.limit)
     else:
+        if len(train_dataset) < 2:
+            raise ValueError("At least two training samples are required when dataset/valid is unavailable.")
         val_size = max(1, int(len(train_dataset) * args.val_ratio))
+        if val_size >= len(train_dataset):
+            val_size = len(train_dataset) - 1
         train_size = len(train_dataset) - val_size
         train_dataset, valid_dataset = random_split(
             train_dataset,
@@ -727,7 +742,11 @@ def make_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     if has_valid:
         valid_dataset = RoadSegmentationDataset(valid_dir, args.image_size, args.limit, target_ann_codes)
     else:
+        if len(train_dataset) < 2:
+            raise ValueError("At least two training samples are required when dataset/valid is unavailable.")
         val_size = max(1, int(len(train_dataset) * args.val_ratio))
+        if val_size >= len(train_dataset):
+            val_size = len(train_dataset) - 1
         train_size = len(train_dataset) - val_size
         train_dataset, valid_dataset = random_split(
             train_dataset,
@@ -785,6 +804,8 @@ def compute_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, flo
 
 def average_metrics(metrics: Iterable[dict[str, float]]) -> dict[str, float]:
     metrics = list(metrics)
+    if not metrics:
+        raise RuntimeError("No metrics were produced; check that the dataloader contains at least one batch.")
     return {key: float(np.mean([item[key] for item in metrics])) for key in metrics[0]}
 
 
@@ -821,18 +842,8 @@ def run_epoch(
     return results
 
 
-def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
-    if args.architecture == "yolo":
-        train_yolo(args)
-        return
-    if args.architecture == "mask2former":
-        train_panoptic(args)
-        return
-
+def train_semantic(args: argparse.Namespace) -> None:
     output_dir = ensure_output_dir(args.output_dir, "training output")
-
     device = resolve_torch_device(args.device)
     train_loader, valid_loader = make_dataloaders(args)
     config = ModelConfig(architecture=args.architecture, model_name_or_path=args.model_name_or_path)
@@ -856,6 +867,20 @@ def main() -> None:
 
     with (output_dir / "history.json").open("w", encoding="utf-8") as file:
         json.dump(history, file, indent=2)
+
+
+TRAIN_DISPATCH = {
+    "segformer": train_semantic,
+    "unet": train_semantic,
+    "yolo": train_yolo,
+    "mask2former": train_panoptic,
+}
+
+
+def main() -> None:
+    args = parse_args()
+    seed_everything(args.seed)
+    TRAIN_DISPATCH[args.architecture](args)
 
 
 

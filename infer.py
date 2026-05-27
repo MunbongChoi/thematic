@@ -17,7 +17,7 @@ from train import IMAGE_MEAN, IMAGE_STD, load_rgb_image, logits_from_model
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run road extraction inference.")
     parser.add_argument("--checkpoint", default="runs/road_extraction/best_model.pt")
-    parser.add_argument("--architecture", default="auto", choices=["auto", "segformer", "unet", "yolo", "mask2former"])
+    parser.add_argument("--architecture", default="auto", type=str.lower, choices=["auto", "segformer", "unet", "yolo", "mask2former"])
     parser.add_argument("--input", required=True, help="Input image file or directory.")
     parser.add_argument("--output-dir", default="outputs/infer")
     parser.add_argument("--image-size", type=int, default=512, help="Required for YOLO inference.")
@@ -39,8 +39,15 @@ def image_to_tensor(image: Image.Image, image_size: int) -> torch.Tensor:
 def iter_images(path: Path) -> list[Path]:
     suffixes = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
     if path.is_file():
+        if path.suffix.lower() not in suffixes:
+            raise ValueError(f"Input file is not a supported image: {path}")
         return [path]
-    return sorted(item for item in path.iterdir() if item.suffix.lower() in suffixes)
+    if not path.exists():
+        raise FileNotFoundError(f"Input path not found: {path}")
+    images = sorted(item for item in path.rglob("*") if item.is_file() and item.suffix.lower() in suffixes)
+    if not images:
+        raise FileNotFoundError(f"No supported images found under: {path}")
+    return images
 
 
 def save_overlay(image: Image.Image, mask: Image.Image, output_path: Path) -> None:
@@ -204,6 +211,8 @@ def main() -> None:
     model.to(device)
     model.eval()
     architecture = checkpoint["architecture"]
+    if args.architecture != "auto" and args.architecture != architecture:
+        raise ValueError(f"Checkpoint architecture is {architecture!r}, but --architecture={args.architecture!r}.")
     if architecture == "mask2former":
         run_panoptic_inference(args, model, checkpoint, device)
         return
