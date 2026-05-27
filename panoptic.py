@@ -23,7 +23,6 @@ from config import (
     PANOPTIC_CATEGORIES,
 )
 
-
 @dataclass(frozen=True)
 class SegmentInfo:
     id: int

@@ -132,7 +132,6 @@ def build_mask2former_model(model_name_or_path: str = DEFAULT_MODEL_NAME, num_la
         ignore_mismatched_sizes=True,
     )
 
-
 def build_mask2former_processor(model_name_or_path: str = DEFAULT_MODEL_NAME) -> Any:
     try:
         from transformers import Mask2FormerImageProcessor

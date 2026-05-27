@@ -174,6 +174,7 @@ python test.py --architecture yolo --checkpoint runs/road_extraction/best_yolo.p
 python test.py --architecture mask2former --checkpoint runs/panoptic_segmentation/best_mask2former.pt --image-size 512
 ```
 
+
 ## Inference
 
 ```powershell

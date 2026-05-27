@@ -19,7 +19,6 @@ from model import build_mask2former_processor, build_yolo_model, load_checkpoint
 import torch
 from torch.utils.data import DataLoader, random_split
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a road extraction checkpoint.")
     parser.add_argument("--checkpoint", default="runs/road_extraction/best_model.pt")

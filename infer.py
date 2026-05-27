@@ -14,7 +14,6 @@ from model import build_mask2former_processor, build_yolo_model, load_checkpoint
 from panoptic import panoptic_id_to_rgb
 from train import IMAGE_MEAN, IMAGE_STD, load_rgb_image, logits_from_model
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run road extraction inference.")
     parser.add_argument("--checkpoint", default="runs/road_extraction/best_model.pt")

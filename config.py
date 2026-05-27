@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-
 PROJECT_NAME = "satellite_panoptic_segmentation"
 
 DATASET_ROOT = Path("dataset")
