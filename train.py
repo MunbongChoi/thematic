@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import shutil
 import warnings
@@ -30,12 +31,17 @@ from panoptic import (
 IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 RASTER_SUFFIXES = {".tif", ".tiff"}
+DEFAULT_OUTPUT_DIR = os.environ.get("SATSEG_OUTPUT_DIR", "runs/road_extraction")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train satellite segmentation model.")
     parser.add_argument("--dataset-root", default="dataset", help="Dataset root containing train/image and train/label.")
-    parser.add_argument("--output-dir", default="runs/road_extraction", help="Directory for checkpoints and metrics.")
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory for checkpoints and metrics. Can also be set with SATSEG_OUTPUT_DIR.",
+    )
     parser.add_argument("--architecture", default="segformer", choices=["segformer", "unet", "yolo", "mask2former"], help="Model architecture.")
     parser.add_argument(
         "--model-name-or-path",
@@ -64,6 +70,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
+
+
+def ensure_output_dir(path: str | Path, purpose: str = "output") -> Path:
+    output_dir = Path(path)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Cannot create {purpose} directory: {output_dir}\n"
+            "The current location is not writable. Use a writable path, for example:\n"
+            f"  python train.py --output-dir /tmp/satellite_runs/{output_dir.name} ...\n"
+            "or set a default for this shell:\n"
+            "  export SATSEG_OUTPUT_DIR=/tmp/satellite_runs/road_extraction"
+        ) from exc
+    if not output_dir.is_dir():
+        raise NotADirectoryError(f"{purpose} path exists but is not a directory: {output_dir}")
+    return output_dir
 
 
 def seed_everything(seed: int) -> None:
@@ -426,8 +449,7 @@ def prepare_yolo_dataset(args: argparse.Namespace, yolo_root: Path) -> Path:
 
 
 def train_yolo(args: argparse.Namespace) -> None:
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = ensure_output_dir(args.output_dir, "YOLO output")
     yolo_root = output_dir / "yolo_dataset"
     data_yaml = prepare_yolo_dataset(args, yolo_root)
     model_name = args.model_name_or_path
@@ -496,7 +518,7 @@ def write_panoptic_split(samples: list[tuple[Path, Path]], split_name: str, outp
 
 def prepare_panoptic_dataset(args: argparse.Namespace, output_root: Path) -> Path:
     train_samples, valid_samples = split_samples(args)
-    output_root.mkdir(parents=True, exist_ok=True)
+    output_root = ensure_output_dir(output_root, "panoptic export")
     for split_name, samples in (("train", train_samples), ("val", valid_samples)):
         dataset = write_panoptic_split(samples, split_name, output_root)
         with (output_root / f"panoptic_{split_name}.json").open("w", encoding="utf-8") as file:
@@ -619,7 +641,7 @@ def run_panoptic_epoch(
 
 def train_panoptic(args: argparse.Namespace) -> None:
     output_dir = OUTPUT_ROOT if args.output_dir == "runs/road_extraction" else Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = ensure_output_dir(output_dir, "Mask2Former output")
     if args.export_panoptic_only:
         path = prepare_panoptic_dataset(args, Path(args.panoptic_data_dir))
         print(f"Exported COCO panoptic dataset to {path}")
@@ -809,8 +831,7 @@ def main() -> None:
         train_panoptic(args)
         return
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = ensure_output_dir(args.output_dir, "training output")
 
     device = resolve_torch_device(args.device)
     train_loader, valid_loader = make_dataloaders(args)

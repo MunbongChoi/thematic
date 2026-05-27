@@ -29,94 +29,21 @@ mapping is inferred from the GeoJSON tile bounds.
 pip install -r requirements.txt
 ```
 
-## Docker GPU Run
+## Writable Output Directory
 
-Build the image from the project root:
-
-```bash
-docker build -f dockerfile -t satellite-seg:cuda124 .
-```
-
-On Windows PowerShell, use backticks instead of Bash backslashes:
-
-```powershell
-docker build -f dockerfile -t satellite-seg:cuda124 .
-```
-
-Run the container with NVIDIA Container Toolkit. Mount the dataset, run outputs,
-and model weights instead of baking them into the image:
+Training writes checkpoints and logs to `--output-dir`. In Linux/Jupyter
+environments, the project directory may be mounted read-only. If
+`runs/road_extraction` raises `PermissionError`, use a writable absolute path:
 
 ```bash
-docker run --rm --gpus all --ipc=host \
-  -v /path/to/dataset:/app/dataset \
-  -v /path/to/runs:/app/runs \
-  -v /path/to/outputs:/app/outputs \
-  -v /path/to/weights:/app/weights \
-  satellite-seg:cuda124 python train.py --architecture yolo \
-    --model-name-or-path /app/weights/yolo26n-seg.pt \
-    --output-dir runs/yolo26_road \
-    --epochs 100 --batch-size 16 --image-size 1024 \
-    --num-workers 8 --target-ann-codes 30 --device 0,1,2,3
+python train.py --architecture segformer --output-dir /tmp/satellite_runs/road_extraction
 ```
 
-PowerShell equivalent:
-
-```powershell
-docker run --rm --gpus all --ipc=host `
-  -v "$((Get-Location).Path)\dataset:/app/dataset" `
-  -v "$((Get-Location).Path)\runs:/app/runs" `
-  -v "$((Get-Location).Path)\outputs:/app/outputs" `
-  -v "$((Get-Location).Path)\weights:/app/weights" `
-  satellite-seg:cuda124 python train.py --architecture yolo `
-    --model-name-or-path /app/weights/yolo26n-seg.pt `
-    --output-dir runs/yolo26_road `
-    --epochs 100 --batch-size 16 --image-size 1024 `
-    --num-workers 8 --target-ann-codes 30 --device 0,1,2,3
-```
-
-The same command as a single line, which avoids line-continuation parsing
-issues:
-
-```powershell
-docker run --rm --gpus all --ipc=host -v "$((Get-Location).Path)\dataset:/app/dataset" -v "$((Get-Location).Path)\runs:/app/runs" -v "$((Get-Location).Path)\outputs:/app/outputs" -v "$((Get-Location).Path)\weights:/app/weights" satellite-seg:cuda124 python train.py --architecture yolo --model-name-or-path /app/weights/yolo26n-seg.pt --output-dir runs/yolo26_road --epochs 100 --batch-size 16 --image-size 1024 --num-workers 8 --target-ann-codes 30 --device 0,1,2,3
-```
-
-If you are using Windows Command Prompt (`cmd.exe`), use `set` and
-`--mount`. This avoids the Windows drive-colon parsing issues that can cause
-`docker: invalid reference format`.
-
-```cmd
-set "PROJECT_DIR=%cd%"
-docker run --rm --gpus all --ipc=host --mount type=bind,source="%PROJECT_DIR%\dataset",target=/app/dataset --mount type=bind,source="%PROJECT_DIR%\runs",target=/app/runs --mount type=bind,source="%PROJECT_DIR%\outputs",target=/app/outputs --mount type=bind,source="%PROJECT_DIR%\weights",target=/app/weights satellite-seg:cuda124 python train.py --architecture yolo --model-name-or-path /app/weights/yolo26n-seg.pt --output-dir runs/yolo26_road --epochs 100 --batch-size 16 --image-size 1024 --num-workers 8 --target-ann-codes 30 --device 0,1,2,3
-```
-
-For CMD multi-line commands, use `^` as the line-continuation character:
-
-```cmd
-set "PROJECT_DIR=%cd%"
-docker run --rm --gpus all --ipc=host ^
-  --mount type=bind,source="%PROJECT_DIR%\dataset",target=/app/dataset ^
-  --mount type=bind,source="%PROJECT_DIR%\runs",target=/app/runs ^
-  --mount type=bind,source="%PROJECT_DIR%\outputs",target=/app/outputs ^
-  --mount type=bind,source="%PROJECT_DIR%\weights",target=/app/weights ^
-  satellite-seg:cuda124 python train.py --architecture yolo ^
-    --model-name-or-path /app/weights/yolo26n-seg.pt ^
-    --output-dir runs/yolo26_road ^
-    --epochs 100 --batch-size 16 --image-size 1024 ^
-    --num-workers 8 --target-ann-codes 30 --device 0,1,2,3
-```
-
-For torch-based models such as Mask2Former, pass one GPU explicitly:
+Or set a default output directory for the shell:
 
 ```bash
-docker run --rm --gpus all --ipc=host \
-  -v /path/to/dataset:/app/dataset \
-  -v /path/to/runs:/app/runs \
-  -v /path/to/outputs:/app/outputs \
-  satellite-seg:cuda124 python train.py --architecture mask2former \
-    --output-dir runs/mask2former_panoptic \
-    --epochs 50 --batch-size 2 --image-size 1024 \
-    --num-workers 8 --device cuda:0
+export SATSEG_OUTPUT_DIR=/tmp/satellite_runs/road_extraction
+python train.py --architecture segformer
 ```
 
 ## Train with Hugging Face SegFormer
