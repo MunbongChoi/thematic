@@ -174,6 +174,12 @@ python test.py --architecture yolo --checkpoint runs/road_extraction/best_yolo.p
 python test.py --architecture mask2former --checkpoint runs/panoptic_segmentation/best_mask2former.pt --image-size 512
 ```
 
+`--checkpoint` normally points to a checkpoint file, not only a run directory.
+For example, use `runs/road_extraction/best_model.pt` instead of
+`runs/road_extraction`. If a run directory is provided, the code tries to find
+one of `best_model.pt`, `best_sam.pt`, `best_mask2former.pt`,
+`best_yolo.pt`, or `yolo/weights/best.pt` inside it.
+
 
 ## Inference
 

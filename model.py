@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -11,6 +12,13 @@ from config import DEFAULT_MODEL_NAME, ID2LABEL as PANOPTIC_LABELS, LABEL2ID as 
 
 ROAD_LABELS = {0: "background", 1: "road"}
 DEFAULT_YOLO_SEG_MODEL = "yolo11n-seg.pt"
+CHECKPOINT_CANDIDATES = (
+    "best_model.pt",
+    "best_sam.pt",
+    "best_mask2former.pt",
+    "best_yolo.pt",
+    "yolo/weights/best.pt",
+)
 
 
 @dataclass(frozen=True)
@@ -151,7 +159,24 @@ def build_yolo_model(model_name_or_path: str = DEFAULT_YOLO_SEG_MODEL) -> Any:
             "ultralytics is required for architecture='yolo'. "
             "Install requirements.txt first."
         ) from exc
-    return YOLO(model_name_or_path)
+    return YOLO(str(resolve_checkpoint_path(model_name_or_path, required=False)))
+
+
+def resolve_checkpoint_path(path: str | Path, required: bool = True) -> Path:
+    checkpoint_path = Path(path)
+    if checkpoint_path.is_dir():
+        for candidate in CHECKPOINT_CANDIDATES:
+            candidate_path = checkpoint_path / candidate
+            if candidate_path.is_file():
+                return candidate_path
+        candidates = ", ".join(CHECKPOINT_CANDIDATES)
+        raise FileNotFoundError(
+            f"Checkpoint path points to a directory: {checkpoint_path}. "
+            f"Pass a checkpoint file directly, or place one of these files inside it: {candidates}"
+        )
+    if required and not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    return checkpoint_path
 
 
 def save_checkpoint(
@@ -176,7 +201,8 @@ def save_checkpoint(
 
 
 def load_checkpoint(path: str, map_location: str | torch.device = "cpu") -> tuple[nn.Module, dict[str, Any]]:
-    checkpoint = torch.load(path, map_location=map_location)
+    checkpoint_path = resolve_checkpoint_path(path)
+    checkpoint = torch.load(checkpoint_path, map_location=map_location)
     config = ModelConfig(
         architecture=checkpoint["architecture"],
         model_name_or_path=checkpoint["model_name_or_path"],
