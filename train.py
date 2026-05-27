@@ -158,8 +158,14 @@ def load_rgb_image(image_path: Path) -> Image.Image:
         try:
             import rasterio
             from rasterio.errors import NotGeoreferencedWarning
-        except ImportError as exc:
-            raise ImportError("rasterio is required to read TIF imagery reliably.") from exc
+        except ImportError:
+            warnings.warn(
+                "rasterio is not installed; falling back to PIL for TIF reading. "
+                "Install rasterio for more reliable geospatial raster handling.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return Image.open(image_path).convert("RGB")
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", NotGeoreferencedWarning)
