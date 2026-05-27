@@ -32,6 +32,33 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+## CUDA Check
+
+If `nvidia-smi` shows a GPU but training says CUDA is unavailable, the active
+Python environment usually has a CPU-only PyTorch build. Check PyTorch from the
+same shell used to run training:
+
+```bash
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("torch CUDA build:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+print("CUDA devices:", torch.cuda.device_count())
+PY
+```
+
+For GPU training, install a CUDA-enabled PyTorch build in that same virtual
+environment, then reinstall the project requirements:
+
+```bash
+python -m pip uninstall -y torch torchvision torchaudio
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -r requirements.txt
+```
+
+Use `--device cpu` only when intentionally training without a GPU.
+
 ## Writable Output Directory
 
 Training writes checkpoints and logs to `--output-dir`. In Linux/Jupyter

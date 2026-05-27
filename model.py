@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,37 @@ class ModelConfig:
     num_labels: int = 2
 
 
+def cuda_diagnostic_message(requested_device: str) -> str:
+    details = [
+        f"CUDA device {requested_device!r} was requested, but PyTorch cannot use CUDA.",
+        f"torch={torch.__version__}",
+        f"torch.version.cuda={torch.version.cuda}",
+        f"torch.cuda.is_available()={torch.cuda.is_available()}",
+        f"torch.cuda.device_count()={torch.cuda.device_count()}",
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
+    ]
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        details.append(f"nvidia-smi=unavailable ({exc})")
+    else:
+        smi_output = result.stdout.strip() or result.stderr.strip()
+        details.append(f"nvidia-smi={smi_output if smi_output else 'no output'}")
+
+    details.append(
+        "If nvidia-smi shows a GPU but torch.version.cuda is None or "
+        "torch.cuda.is_available() is False, install a CUDA-enabled PyTorch "
+        "build in this same Python environment."
+    )
+    return "\n".join(details)
+
+
 def resolve_torch_device(device: str | None = None) -> torch.device:
     if device is None or device == "":
         return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -42,19 +75,22 @@ def resolve_torch_device(device: str | None = None) -> torch.device:
         normalized = first_device
     if normalized.isdigit():
         if not torch.cuda.is_available():
-            raise RuntimeError(f"CUDA device {normalized!r} was requested, but CUDA is not available.")
+            raise RuntimeError(cuda_diagnostic_message(normalized))
         index = int(normalized)
         if index >= torch.cuda.device_count():
             raise RuntimeError(f"CUDA device index {index} is unavailable. Found {torch.cuda.device_count()} CUDA device(s).")
         return torch.device(f"cuda:{index}")
     if normalized == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested, but CUDA is not available.")
+            raise RuntimeError(cuda_diagnostic_message(normalized))
         return torch.device("cuda:0")
     if normalized.startswith("cuda:"):
         if not torch.cuda.is_available():
-            raise RuntimeError(f"{device!r} was requested, but CUDA is not available.")
-        index = int(normalized.split(":", maxsplit=1)[1])
+            raise RuntimeError(cuda_diagnostic_message(normalized))
+        try:
+            index = int(normalized.split(":", maxsplit=1)[1])
+        except ValueError as exc:
+            raise ValueError(f"Invalid CUDA device string: {device!r}. Use '0', 'cuda', or 'cuda:0'.") from exc
         if index >= torch.cuda.device_count():
             raise RuntimeError(f"CUDA device index {index} is unavailable. Found {torch.cuda.device_count()} CUDA device(s).")
     return torch.device(normalized)
