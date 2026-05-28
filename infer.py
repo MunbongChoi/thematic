@@ -9,25 +9,43 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from config import PANOPTIC_CATEGORIES
+from config import (
+    DEFAULT_IMAGE_SIZE,
+    IMAGE_EXTENSIONS,
+    MASK2FORMER_ID_TO_NAME,
+    OUTPUT_ROOT,
+    TRAIN_ID_TO_COLOR,
+    TRAIN_ID_TO_NAME,
+    YOLO_ID_TO_NAME,
+    YOLO_ID_TO_TRAIN_ID,
+)
 from model import build_mask2former_processor, build_yolo_model, load_checkpoint, resolve_torch_device
-from panoptic import panoptic_id_to_rgb
 from train import IMAGE_MEAN, IMAGE_STD, load_rgb_image, logits_from_model
 
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run road extraction inference.")
-    parser.add_argument("--checkpoint", default="runs/road_extraction/best_model.pt")
-    parser.add_argument("--architecture", default="auto", type=str.lower, choices=["auto", "segformer", "unet", "yolo", "mask2former"])
+    parser = argparse.ArgumentParser(description="Run segmentation inference and save masks/overlays/results JSON.")
+    parser.add_argument("--checkpoint", default=str(OUTPUT_ROOT / "unet" / "best.pt"))
+    parser.add_argument("--architecture", default="auto", choices=["auto", "yolo", "unet", "segformer", "mask2former"])
     parser.add_argument("--input", required=True, help="Input image file or directory.")
     parser.add_argument("--output-dir", default="outputs/infer")
-    parser.add_argument("--image-size", type=int, default=512, help="Required for YOLO inference.")
-    parser.add_argument("--threshold", type=float, default=None, help="Optional road probability threshold.")
-    parser.add_argument(
-        "--device",
-        default=None,
-        help="GPU device for inference. Use '0' or 'cuda:0' for torch models, and '0,1,2,3' for YOLO.",
-    )
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument("--threshold", type=float, default=0.25, help="YOLO confidence threshold.")
+    parser.add_argument("--device", default=None)
     return parser.parse_args()
+
+
+def iter_images(path: Path) -> list[Path]:
+    if path.is_file():
+        if path.suffix.lower() not in IMAGE_EXTENSIONS:
+            raise ValueError(f"Unsupported image file: {path}")
+        return [path]
+    if not path.exists():
+        raise FileNotFoundError(f"Input path not found: {path}")
+    images = sorted(item for item in path.rglob("*") if item.is_file() and item.suffix.lower() in IMAGE_EXTENSIONS)
+    if not images:
+        raise FileNotFoundError(f"No supported images found under: {path}")
+    return images
 
 
 def image_to_tensor(image: Image.Image, image_size: int) -> torch.Tensor:
@@ -36,220 +54,183 @@ def image_to_tensor(image: Image.Image, image_size: int) -> torch.Tensor:
     return (tensor - IMAGE_MEAN) / IMAGE_STD
 
 
-def iter_images(path: Path) -> list[Path]:
-    suffixes = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-    if path.is_file():
-        if path.suffix.lower() not in suffixes:
-            raise ValueError(f"Input file is not a supported image: {path}")
-        return [path]
-    if not path.exists():
-        raise FileNotFoundError(f"Input path not found: {path}")
-    images = sorted(item for item in path.rglob("*") if item.is_file() and item.suffix.lower() in suffixes)
-    if not images:
-        raise FileNotFoundError(f"No supported images found under: {path}")
-    return images
+def colorize_mask(mask: np.ndarray) -> Image.Image:
+    rgb = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    for class_id, color in TRAIN_ID_TO_COLOR.items():
+        rgb[mask == int(class_id)] = color
+    return Image.fromarray(rgb, mode="RGB")
 
 
-def save_overlay(image: Image.Image, mask: Image.Image, output_path: Path) -> None:
+def save_overlay(image: Image.Image, mask: np.ndarray, output_path: Path, alpha: int = 115) -> None:
     image_rgba = image.convert("RGBA")
-    road = np.asarray(mask) > 0
-    overlay = np.zeros((mask.height, mask.width, 4), dtype=np.uint8)
-    overlay[road] = [255, 40, 40, 110]
-    overlay_image = Image.fromarray(overlay, mode="RGBA")
-    Image.alpha_composite(image_rgba, overlay_image).save(output_path)
-
-
-def save_panoptic_overlay(
-    image: Image.Image,
-    segmentation: torch.Tensor,
-    segments_info: list[dict],
-    output_path: Path,
-) -> None:
-    image_rgba = image.convert("RGBA")
-    overlay = np.zeros((image.height, image.width, 4), dtype=np.uint8)
-    category_colors = {category.train_id: category.color for category in PANOPTIC_CATEGORIES}
-    for info in segments_info:
-        label_id = int(info.get("label_id", info.get("category_id", 0)))
-        color = category_colors.get(label_id, (255, 40, 40))
-        mask = segmentation.cpu().numpy() == int(info["id"])
-        overlay[mask] = [color[0], color[1], color[2], 115]
+    color = np.asarray(colorize_mask(mask), dtype=np.uint8)
+    overlay = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    foreground = mask > 0
+    overlay[..., :3] = color
+    overlay[..., 3] = np.where(foreground, alpha, 0).astype(np.uint8)
     Image.alpha_composite(image_rgba, Image.fromarray(overlay, mode="RGBA")).save(output_path)
 
 
-def json_scalar(value: object) -> object:
-    if isinstance(value, torch.Tensor):
-        return int(value.detach().cpu().item()) if value.numel() == 1 else value.detach().cpu().tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
+def class_summary(mask: np.ndarray) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for class_id, class_name in TRAIN_ID_TO_NAME.items():
+        count = int((mask == int(class_id)).sum())
+        if count:
+            summary[class_name] = count
+    return summary
 
 
-def run_panoptic_inference(args: argparse.Namespace, model: torch.nn.Module, checkpoint: dict, device: torch.device) -> None:
+def save_semantic_outputs(image_path: Path, image: Image.Image, mask: np.ndarray, output_dir: Path) -> dict[str, object]:
+    mask_path = output_dir / f"{image_path.stem}_mask.png"
+    color_path = output_dir / f"{image_path.stem}_color.png"
+    overlay_path = output_dir / f"{image_path.stem}_overlay.png"
+    Image.fromarray(mask.astype(np.uint8), mode="L").save(mask_path)
+    colorize_mask(mask).save(color_path)
+    save_overlay(image, mask, overlay_path)
+    return {
+        "image": str(image_path),
+        "mask": str(mask_path),
+        "color_mask": str(color_path),
+        "overlay": str(overlay_path),
+        "pixel_counts": class_summary(mask),
+        "crs_note": "Output is a pixel-space segmentation mask. No distance/area CRS operation is performed.",
+    }
+
+
+def run_torch_semantic(args: argparse.Namespace, architecture: str, model: torch.nn.Module, checkpoint: dict, device: torch.device) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    model.to(device)
+    model.eval()
     image_size = int(checkpoint.get("image_size", args.image_size))
-    processor = build_mask2former_processor(checkpoint["model_name_or_path"])
-    label_ids_to_fuse = {int(idx) for idx, label in checkpoint["id2label"].items() if int(idx) != 1 and label != "building"}
-    results = []
-
+    results: list[dict[str, object]] = []
     for image_path in iter_images(Path(args.input)):
         image = load_rgb_image(image_path)
-        original_size = image.size
         tensor = image_to_tensor(image, image_size).unsqueeze(0).to(device)
         with torch.no_grad():
-            outputs = model(pixel_values=tensor)
-            processed = processor.post_process_panoptic_segmentation(
-                outputs,
-                target_sizes=[(original_size[1], original_size[0])],
-                label_ids_to_fuse=label_ids_to_fuse,
-            )[0]
-
-        segmentation = processed["segmentation"].detach().cpu()
-        segments_info = processed["segments_info"]
-        panoptic_path = output_dir / f"{image_path.stem}_panoptic.png"
-        overlay_path = output_dir / f"{image_path.stem}_panoptic_overlay.png"
-        panoptic_id_to_rgb(segmentation.numpy()).save(panoptic_path)
-        save_panoptic_overlay(image, segmentation, segments_info, overlay_path)
-
-        instance_paths = []
-        summary: dict[str, int] = {}
-        serializable_segments = []
-        for idx, info in enumerate(segments_info, start=1):
-            label_id = int(info.get("label_id", info.get("category_id", 0)))
-            label = checkpoint["id2label"].get(label_id, checkpoint["id2label"].get(str(label_id), str(label_id)))
-            summary[label] = summary.get(label, 0) + 1
-            segment_row = {key: json_scalar(value) for key, value in info.items()}
-            segment_row["label"] = label
-            serializable_segments.append(segment_row)
-            if label == "building":
-                instance_mask = (segmentation.numpy() == int(info["id"])).astype(np.uint8) * 255
-                instance_path = output_dir / f"{image_path.stem}_building_{idx:03d}.png"
-                Image.fromarray(instance_mask, mode="L").save(instance_path)
-                instance_paths.append(str(instance_path))
-
-        result = {
-            "image": str(image_path),
-            "panoptic": str(panoptic_path),
-            "overlay": str(overlay_path),
-            "building_instance_masks": instance_paths,
-            "category_summary": summary,
-            "segments_info": serializable_segments,
-            "crs_note": "Output is pixel-space. Source CRS is not modified or used for measurement.",
-        }
-        results.append(result)
-
-    with (output_dir / "results.json").open("w", encoding="utf-8") as file:
-        json.dump(results, file, indent=2)
+            logits, _ = logits_from_model(model, architecture, tensor)
+            logits = F.interpolate(logits, size=(image.height, image.width), mode="bilinear", align_corners=False)
+            mask = logits.argmax(dim=1)[0].detach().cpu().numpy().astype(np.uint8)
+        results.append(save_semantic_outputs(image_path, image, mask, output_dir))
+    (output_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
 
 
-def run_yolo_inference(args: argparse.Namespace) -> None:
+def run_yolo(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     model = build_yolo_model(args.checkpoint)
-    confidence = args.threshold if args.threshold is not None else 0.25
     predict_kwargs = {
         "source": args.input,
         "task": "segment",
         "imgsz": args.image_size,
-        "conf": confidence,
+        "conf": args.threshold,
         "stream": False,
         "verbose": False,
     }
     if args.device:
         predict_kwargs["device"] = args.device
     predictions = model.predict(**predict_kwargs)
-
-    results = []
+    results: list[dict[str, object]] = []
     for result in predictions:
         image_path = Path(result.path)
         image = Image.fromarray(result.orig_img[:, :, ::-1]).convert("RGB")
-        if result.masks is None:
-            mask_array = np.zeros((image.height, image.width), dtype=np.uint8)
-        else:
-            mask_tensor = result.masks.data.detach().cpu()
-            combined = torch.any(mask_tensor > 0.5, dim=0).numpy().astype(np.uint8)
-            mask_array = np.asarray(
-                Image.fromarray(combined * 255, mode="L").resize(image.size, Image.NEAREST),
-                dtype=np.uint8,
+        semantic = np.zeros((image.height, image.width), dtype=np.uint8)
+        instances: list[dict[str, object]] = []
+        if result.masks is not None and result.boxes is not None:
+            masks = result.masks.data.detach().cpu()
+            classes = result.boxes.cls.detach().cpu().numpy().astype(int)
+            confidences = result.boxes.conf.detach().cpu().numpy()
+            for idx, (mask_tensor, yolo_id, confidence) in enumerate(zip(masks, classes, confidences), start=1):
+                mask_image = Image.fromarray((mask_tensor.numpy() > 0.5).astype(np.uint8), mode="L").resize(image.size, Image.NEAREST)
+                instance_mask = np.asarray(mask_image, dtype=bool)
+                train_id = YOLO_ID_TO_TRAIN_ID.get(int(yolo_id), 0)
+                semantic[instance_mask] = train_id
+                instances.append(
+                    {
+                        "id": idx,
+                        "yolo_class_id": int(yolo_id),
+                        "class_name": YOLO_ID_TO_NAME.get(int(yolo_id), str(yolo_id)),
+                        "confidence": float(confidence),
+                        "pixel_count": int(instance_mask.sum()),
+                    }
+                )
+        row = save_semantic_outputs(image_path, image, semantic, output_dir)
+        row["instances"] = instances
+        results.append(row)
+    (output_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+
+
+def run_mask2former(args: argparse.Namespace, model: torch.nn.Module, checkpoint: dict, device: torch.device) -> None:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model.to(device)
+    model.eval()
+    image_size = int(checkpoint.get("image_size", args.image_size))
+    processor = build_mask2former_processor(checkpoint.get("model_name_or_path"))
+    label_ids_to_fuse = set(MASK2FORMER_ID_TO_NAME.keys())
+    results: list[dict[str, object]] = []
+    for image_path in iter_images(Path(args.input)):
+        image = load_rgb_image(image_path)
+        tensor = image_to_tensor(image, image_size).unsqueeze(0).to(device)
+        with torch.no_grad():
+            outputs = model(pixel_values=tensor)
+            processed = processor.post_process_panoptic_segmentation(
+                outputs,
+                target_sizes=[(image.height, image.width)],
+                label_ids_to_fuse=label_ids_to_fuse,
+            )[0]
+        panoptic = processed["segmentation"].detach().cpu().numpy()
+        semantic = np.zeros((image.height, image.width), dtype=np.uint8)
+        segments: list[dict[str, object]] = []
+        for info in processed["segments_info"]:
+            label_id = int(info.get("label_id", info.get("category_id", 0)))
+            train_id = YOLO_ID_TO_TRAIN_ID.get(label_id, 0)
+            segment_mask = panoptic == int(info["id"])
+            semantic[segment_mask] = train_id
+            segments.append(
+                {
+                    "id": int(info["id"]),
+                    "label_id": label_id,
+                    "class_name": MASK2FORMER_ID_TO_NAME.get(label_id, str(label_id)),
+                    "score": float(info.get("score", 0.0)),
+                    "pixel_count": int(segment_mask.sum()),
+                }
             )
-
-        mask_image = Image.fromarray(mask_array, mode="L")
-        mask_path = output_dir / f"{image_path.stem}_road_mask.png"
-        overlay_path = output_dir / f"{image_path.stem}_overlay.png"
-        mask_image.save(mask_path)
-        save_overlay(image, mask_image, overlay_path)
-        results.append(
-            {
-                "image": str(image_path),
-                "mask": str(mask_path),
-                "overlay": str(overlay_path),
-                "crs_note": "Output is pixel-space. Source CRS is not modified or used for measurement.",
-            }
-        )
-
-    with (output_dir / "results.json").open("w", encoding="utf-8") as file:
-        json.dump(results, file, indent=2)
+        row = save_semantic_outputs(image_path, image, semantic, output_dir)
+        panoptic_path = output_dir / f"{image_path.stem}_panoptic_ids.png"
+        Image.fromarray(np.clip(panoptic, 0, 255).astype(np.uint8), mode="L").save(panoptic_path)
+        row["panoptic_ids"] = str(panoptic_path)
+        row["segments"] = segments
+        results.append(row)
+    (output_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
 
 
 def main() -> None:
     args = parse_args()
     if args.architecture == "yolo":
-        run_yolo_inference(args)
+        run_yolo(args)
         return
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_torch_device(args.device)
     try:
         model, checkpoint = load_checkpoint(args.checkpoint, map_location=device)
     except Exception:
         if args.architecture == "auto":
-            run_yolo_inference(args)
+            run_yolo(args)
             return
         raise
-    model.to(device)
-    model.eval()
-    architecture = checkpoint["architecture"]
+
+    architecture = str(checkpoint["architecture"])
     if args.architecture != "auto" and args.architecture != architecture:
         raise ValueError(f"Checkpoint architecture is {architecture!r}, but --architecture={args.architecture!r}.")
     if architecture == "mask2former":
-        run_panoptic_inference(args, model, checkpoint, device)
-        return
-    image_size = int(checkpoint.get("image_size", 512))
-
-    results = []
-    for image_path in iter_images(Path(args.input)):
-        image = load_rgb_image(image_path)
-        original_size = image.size
-        tensor = image_to_tensor(image, image_size).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            logits, _ = logits_from_model(model, architecture, tensor)
-            logits = F.interpolate(logits, size=(original_size[1], original_size[0]), mode="bilinear", align_corners=False)
-            probs = torch.softmax(logits, dim=1)[0, 1]
-            if args.threshold is None:
-                mask = logits.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
-            else:
-                mask = (probs.cpu().numpy() >= args.threshold).astype(np.uint8)
-
-        mask_image = Image.fromarray(mask * 255, mode="L")
-        mask_path = output_dir / f"{image_path.stem}_road_mask.png"
-        overlay_path = output_dir / f"{image_path.stem}_overlay.png"
-        mask_image.save(mask_path)
-        save_overlay(image, mask_image, overlay_path)
-        results.append(
-            {
-                "image": str(image_path),
-                "mask": str(mask_path),
-                "overlay": str(overlay_path),
-                "crs_note": "Output is pixel-space. Source CRS is not modified or used for measurement.",
-            }
-        )
-
-    with (output_dir / "results.json").open("w", encoding="utf-8") as file:
-        json.dump(results, file, indent=2)
+        run_mask2former(args, model, checkpoint, device)
+    elif architecture in {"unet", "segformer"}:
+        run_torch_semantic(args, architecture, model, checkpoint, device)
+    else:
+        raise ValueError(f"Unsupported checkpoint architecture: {architecture}")
 
 
 if __name__ == "__main__":
     main()
+

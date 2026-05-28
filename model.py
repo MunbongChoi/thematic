@@ -6,35 +6,49 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# This Windows environment fails OpenMP initialization when torch is loaded
-# before numpy, while the training/inference entrypoints already load numpy first.
 import numpy as np  # noqa: F401
 import torch
 from torch import nn
 
-from config import DEFAULT_MODEL_NAME, ID2LABEL as PANOPTIC_LABELS, LABEL2ID as PANOPTIC_LABEL2ID, NUM_CLASSES
-
-
-ROAD_LABELS = {0: "background", 1: "road"}
-DEFAULT_YOLO_SEG_MODEL = "yolo11n-seg.pt"
-CHECKPOINT_CANDIDATES = (
-    "best_model.pt",
-    "last_model.pt",
-    "best_sam.pt",
-    "best_mask2former.pt",
-    "last_mask2former.pt",
-    "best_yolo.pt",
-    "last_yolo.pt",
-    "yolo/weights/best.pt",
-    "yolo/weights/last.pt",
+from config import (
+    DEFAULT_MASK2FORMER_MODEL,
+    DEFAULT_SEGFORMER_MODEL,
+    DEFAULT_YOLO_MODEL,
+    MASK2FORMER_ID_TO_NAME,
+    MASK2FORMER_NAME_TO_ID,
+    NUM_SEGMENT_CLASSES,
+    NUM_SEMANTIC_CLASSES,
+    TRAIN_ID_TO_NAME,
 )
+
+
+SUPPORTED_ARCHITECTURES = ("yolo", "unet", "segformer", "mask2former")
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    architecture: str = "segformer"
-    model_name_or_path: str = "nvidia/segformer-b0-finetuned-ade-512-512"
-    num_labels: int = 2
+    architecture: str
+    model_name_or_path: str | None = None
+    num_labels: int | None = None
+
+    def normalized(self) -> "ModelConfig":
+        architecture = self.architecture.strip().lower()
+        if architecture not in SUPPORTED_ARCHITECTURES:
+            choices = ", ".join(SUPPORTED_ARCHITECTURES)
+            raise ValueError(f"Unsupported architecture {self.architecture!r}. Choose one of: {choices}")
+        if architecture == "yolo":
+            model_name = self.model_name_or_path or DEFAULT_YOLO_MODEL
+            num_labels = NUM_SEGMENT_CLASSES
+        elif architecture == "mask2former":
+            model_name = self.model_name_or_path or DEFAULT_MASK2FORMER_MODEL
+            num_labels = NUM_SEGMENT_CLASSES
+        elif architecture == "segformer":
+            model_name = self.model_name_or_path or DEFAULT_SEGFORMER_MODEL
+            num_labels = NUM_SEMANTIC_CLASSES
+        else:
+            model_name = self.model_name_or_path or "unet"
+            num_labels = NUM_SEMANTIC_CLASSES
+        return ModelConfig(architecture=architecture, model_name_or_path=model_name, num_labels=num_labels)
 
 
 def cuda_diagnostic_message(requested_device: str) -> str:
@@ -57,14 +71,9 @@ def cuda_diagnostic_message(requested_device: str) -> str:
     except (OSError, subprocess.TimeoutExpired) as exc:
         details.append(f"nvidia-smi=unavailable ({exc})")
     else:
-        smi_output = result.stdout.strip() or result.stderr.strip()
-        details.append(f"nvidia-smi={smi_output if smi_output else 'no output'}")
-
-    details.append(
-        "If nvidia-smi shows a GPU but torch.version.cuda is None or "
-        "torch.cuda.is_available() is False, install a CUDA-enabled PyTorch "
-        "build in this same Python environment."
-    )
+        output = result.stdout.strip() or result.stderr.strip()
+        details.append(f"nvidia-smi={output if output else 'no output'}")
+    details.append("Install a CUDA-enabled PyTorch build in this same environment if GPU training is required.")
     return "\n".join(details)
 
 
@@ -99,7 +108,6 @@ def resolve_torch_device(device: str | None = None) -> torch.device:
         return torch.device("cpu")
     if normalized and not (normalized == "cuda" or normalized.startswith("cuda:") or normalized[0].isdigit()):
         return torch.device(normalized)
-
     device_ids = resolve_torch_device_ids(device)
     if device_ids:
         return torch.device(f"cuda:{device_ids[0]}")
@@ -125,15 +133,16 @@ class ConvBlock(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels: int = 3, num_labels: int = 2, base_channels: int = 32) -> None:
+    def __init__(self, in_channels: int = 3, num_labels: int = NUM_SEMANTIC_CLASSES, base_channels: int = 32) -> None:
         super().__init__()
         self.enc1 = ConvBlock(in_channels, base_channels)
         self.enc2 = ConvBlock(base_channels, base_channels * 2)
         self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
+        self.enc4 = ConvBlock(base_channels * 4, base_channels * 8)
         self.pool = nn.MaxPool2d(2)
-
-        self.bottleneck = ConvBlock(base_channels * 4, base_channels * 8)
-
+        self.bottleneck = ConvBlock(base_channels * 8, base_channels * 16)
+        self.up4 = nn.ConvTranspose2d(base_channels * 16, base_channels * 8, kernel_size=2, stride=2)
+        self.dec4 = ConvBlock(base_channels * 16, base_channels * 8)
         self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, kernel_size=2, stride=2)
         self.dec3 = ConvBlock(base_channels * 8, base_channels * 4)
         self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=2, stride=2)
@@ -146,84 +155,60 @@ class UNet(nn.Module):
         enc1 = self.enc1(x)
         enc2 = self.enc2(self.pool(enc1))
         enc3 = self.enc3(self.pool(enc2))
-
-        x = self.bottleneck(self.pool(enc3))
-        x = self.up3(x)
-        x = torch.cat([x, enc3], dim=1)
-        x = self.dec3(x)
-        x = self.up2(x)
-        x = torch.cat([x, enc2], dim=1)
-        x = self.dec2(x)
-        x = self.up1(x)
-        x = torch.cat([x, enc1], dim=1)
-        x = self.dec1(x)
+        enc4 = self.enc4(self.pool(enc3))
+        x = self.bottleneck(self.pool(enc4))
+        x = self.dec4(torch.cat([self.up4(x), enc4], dim=1))
+        x = self.dec3(torch.cat([self.up3(x), enc3], dim=1))
+        x = self.dec2(torch.cat([self.up2(x), enc2], dim=1))
+        x = self.dec1(torch.cat([self.up1(x), enc1], dim=1))
         return self.head(x)
 
 
 def build_model(config: ModelConfig) -> nn.Module:
-    architecture = config.architecture.lower()
-    if architecture == "unet":
-        return UNet(num_labels=config.num_labels)
-    if architecture in {"mask2former", "panoptic"}:
-        return build_mask2former_model(config.model_name_or_path, config.num_labels)
-    if architecture == "segformer":
+    cfg = config.normalized()
+    if cfg.architecture == "unet":
+        return UNet(num_labels=int(cfg.num_labels or NUM_SEMANTIC_CLASSES))
+    if cfg.architecture == "segformer":
         try:
             from transformers import AutoModelForSemanticSegmentation
         except ImportError as exc:
-            raise ImportError(
-                "transformers is required for architecture='segformer'. "
-                "Install requirements.txt or use --architecture unet."
-            ) from exc
-
+            raise ImportError("transformers is required for SegFormer. Install requirements.txt.") from exc
         return AutoModelForSemanticSegmentation.from_pretrained(
-            config.model_name_or_path,
-            num_labels=config.num_labels,
-            id2label=ROAD_LABELS,
-            label2id={label: idx for idx, label in ROAD_LABELS.items()},
+            str(cfg.model_name_or_path),
+            num_labels=int(cfg.num_labels or NUM_SEMANTIC_CLASSES),
+            id2label=TRAIN_ID_TO_NAME,
+            label2id={name: idx for idx, name in TRAIN_ID_TO_NAME.items()},
             ignore_mismatched_sizes=True,
         )
-    if architecture == "yolo":
-        raise ValueError("Use build_yolo_model() for architecture='yolo'.")
-    raise ValueError(f"Unsupported architecture: {config.architecture}")
+    if cfg.architecture == "mask2former":
+        try:
+            from transformers import Mask2FormerForUniversalSegmentation
+        except ImportError as exc:
+            raise ImportError("transformers is required for Mask2Former. Install requirements.txt.") from exc
+        return Mask2FormerForUniversalSegmentation.from_pretrained(
+            str(cfg.model_name_or_path),
+            num_labels=int(cfg.num_labels or NUM_SEGMENT_CLASSES),
+            id2label=MASK2FORMER_ID_TO_NAME,
+            label2id=MASK2FORMER_NAME_TO_ID,
+            ignore_mismatched_sizes=True,
+        )
+    raise ValueError("Use build_yolo_model() for architecture='yolo'.")
 
 
-def build_mask2former_model(model_name_or_path: str = DEFAULT_MODEL_NAME, num_labels: int = NUM_CLASSES) -> nn.Module:
-    try:
-        from transformers import Mask2FormerForUniversalSegmentation
-    except ImportError as exc:
-        raise ImportError(
-            "transformers is required for architecture='mask2former'. "
-            "Install requirements.txt first."
-        ) from exc
-
-    return Mask2FormerForUniversalSegmentation.from_pretrained(
-        model_name_or_path,
-        num_labels=num_labels,
-        id2label=PANOPTIC_LABELS,
-        label2id=PANOPTIC_LABEL2ID,
-        ignore_mismatched_sizes=True,
-    )
-
-def build_mask2former_processor(model_name_or_path: str = DEFAULT_MODEL_NAME) -> Any:
+def build_mask2former_processor(model_name_or_path: str | None = None) -> Any:
     try:
         from transformers import Mask2FormerImageProcessor
     except ImportError as exc:
-        raise ImportError(
-            "transformers is required for Mask2Former image processing. "
-            "Install requirements.txt first."
-        ) from exc
-    return Mask2FormerImageProcessor.from_pretrained(model_name_or_path)
+        raise ImportError("transformers is required for Mask2Former inference. Install requirements.txt.") from exc
+    return Mask2FormerImageProcessor.from_pretrained(model_name_or_path or DEFAULT_MASK2FORMER_MODEL)
 
 
-def build_yolo_model(model_name_or_path: str = DEFAULT_YOLO_SEG_MODEL) -> Any:
+def build_yolo_model(model_name_or_path: str | Path | None = None) -> Any:
     try:
         from ultralytics import YOLO
     except ImportError as exc:
-        raise ImportError(
-            "ultralytics is required for architecture='yolo'. "
-            "Install requirements.txt first."
-        ) from exc
-    return YOLO(str(resolve_checkpoint_path(model_name_or_path, required=False)))
+        raise ImportError("ultralytics is required for YOLO segmentation. Install requirements.txt.") from exc
+    return YOLO(str(model_name_or_path or DEFAULT_YOLO_MODEL))
 
 
 @dataclass
@@ -234,7 +219,8 @@ class ModelAPI:
 
     @classmethod
     def create(cls, config: ModelConfig) -> "ModelAPI":
-        return cls(config=config, module=build_model(config))
+        cfg = config.normalized()
+        return cls(config=cfg, module=build_model(cfg))
 
     def prepare_for_training(self, device_arg: str | None = None) -> "ModelAPI":
         self.device = resolve_torch_device(device_arg)
@@ -249,25 +235,8 @@ class ModelAPI:
         save_checkpoint(path, self.module, self.config, image_size, metrics)
 
 
-def resolve_checkpoint_path(path: str | Path, required: bool = True) -> Path:
-    checkpoint_path = Path(path)
-    if checkpoint_path.is_dir():
-        for candidate in CHECKPOINT_CANDIDATES:
-            candidate_path = checkpoint_path / candidate
-            if candidate_path.is_file():
-                return candidate_path
-        candidates = ", ".join(CHECKPOINT_CANDIDATES)
-        raise FileNotFoundError(
-            f"Checkpoint path points to a directory: {checkpoint_path}. "
-            f"Pass a checkpoint file directly, or place one of these files inside it: {candidates}"
-        )
-    if required and not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
-    return checkpoint_path
-
-
 def save_checkpoint(
-    path: str,
+    path: str | Path,
     model: nn.Module,
     config: ModelConfig,
     image_size: int,
@@ -282,36 +251,35 @@ def save_checkpoint(
         "num_labels": config.num_labels,
         "image_size": image_size,
         "state_dict": model_to_save.state_dict(),
-        "id2label": PANOPTIC_LABELS if config.architecture in {"mask2former", "panoptic"} else ROAD_LABELS,
+        "semantic_id2label": TRAIN_ID_TO_NAME,
+        "mask2former_id2label": MASK2FORMER_ID_TO_NAME,
         "metrics": metrics or {},
     }
-    try:
-        torch.save(checkpoint, checkpoint_path)
-    except (OSError, RuntimeError) as exc:
-        raise RuntimeError(
-            f"Failed to write checkpoint: {checkpoint_path.resolve()}\n"
-            "The output directory is not writable by this Python process, "
-            "the filesystem is full, or the path is on a restricted/mounted volume. "
-            "Use a writable absolute --output-dir such as /tmp/satellite_runs/road_extraction "
-            "or /home/jovyan/work/thematic/runs/road_extraction."
-        ) from exc
+    torch.save(checkpoint, checkpoint_path)
 
 
-def load_checkpoint(path: str, map_location: str | torch.device = "cpu") -> tuple[nn.Module, dict[str, Any]]:
+def resolve_checkpoint_path(path: str | Path) -> Path:
+    checkpoint_path = Path(path)
+    if checkpoint_path.is_dir():
+        for candidate in ("best.pt", "last.pt", "weights/best.pt", "weights/last.pt"):
+            candidate_path = checkpoint_path / candidate
+            if candidate_path.is_file():
+                return candidate_path
+        raise FileNotFoundError(f"No best.pt or last.pt checkpoint found under: {checkpoint_path}")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    return checkpoint_path
+
+
+def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> tuple[nn.Module, dict[str, Any]]:
     checkpoint_path = resolve_checkpoint_path(path)
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=map_location)
-    except RuntimeError as exc:
-        raise RuntimeError(
-            f"Failed to open checkpoint: {checkpoint_path.resolve()}. "
-            "Check that the file exists, is not empty, and is readable. "
-            "If training was interrupted while saving, delete the partial file and train again."
-        ) from exc
+    checkpoint = torch.load(checkpoint_path, map_location=map_location)
     config = ModelConfig(
-        architecture=checkpoint["architecture"],
-        model_name_or_path=checkpoint["model_name_or_path"],
-        num_labels=int(checkpoint.get("num_labels", 2)),
-    )
+        architecture=str(checkpoint["architecture"]),
+        model_name_or_path=checkpoint.get("model_name_or_path"),
+        num_labels=int(checkpoint.get("num_labels") or NUM_SEMANTIC_CLASSES),
+    ).normalized()
     model = build_model(config)
     model.load_state_dict(checkpoint["state_dict"])
     return model, checkpoint
+

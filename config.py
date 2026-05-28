@@ -3,88 +3,71 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-PROJECT_NAME = "satellite_panoptic_segmentation"
-
 DATASET_ROOT = Path("dataset")
-TRAIN_IMAGE_DIR = DATASET_ROOT / "train" / "image"
-TRAIN_LABEL_DIR = DATASET_ROOT / "train" / "label"
-VALID_IMAGE_DIR = DATASET_ROOT / "valid" / "image"
-VALID_LABEL_DIR = DATASET_ROOT / "valid" / "label"
+OUTPUT_ROOT = Path("runs") / "segmentation"
+PREPARED_ROOT = Path("outputs") / "prepared"
 
-OUTPUT_ROOT = Path("runs") / "panoptic_segmentation"
-PANOPTIC_DATASET_DIR = Path("outputs") / "panoptic_dataset"
-
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 RASTER_EXTENSIONS = {".tif", ".tiff"}
 LABEL_EXTENSION = ".json"
 
-# The changed labels store map-space GeoJSON geometries in EPSG:5186.
-# Source TIFs in this workspace do not expose geotransforms, so later dataset
-# code should map coordinates into pixel space from the label tile bounds.
+# Labels are GeoJSON polygons in Korea 2000 Central Belt coordinates.
+# The training code maps CRS coordinates to tile pixel space only; it does not
+# compute distance, area, density, or buffer values from these coordinates.
 LABEL_CRS_EPSG = 5186
 ANALYSIS_CRS_EPSG = 5186
-OUTPUT_CRS_EPSG = 4326
+OUTPUT_CRS = "pixel"
 GEOMETRY_FIELD = "geometry"
 GEOMETRY_TYPES = {"Polygon", "MultiPolygon"}
-LABEL_FEATURES_FIELD = "features"
-LABEL_PROPERTIES_FIELD = "properties"
+FEATURES_FIELD = "features"
+PROPERTIES_FIELD = "properties"
 ANN_CODE_FIELD = "ANN_CD"
 
-PANOPTIC_VOID_LABEL = 255
-BACKGROUND_LABEL = 0
+BACKGROUND_ID = 0
+IGNORE_INDEX = 255
 DEFAULT_IMAGE_SIZE = 512
 DEFAULT_SEED = 42
 
-DEFAULT_MODEL_NAME = "facebook/mask2former-swin-tiny-coco-panoptic"
-DEFAULT_ARCHITECTURE = "mask2former"
+DEFAULT_YOLO_MODEL = "yolo11n-seg.pt"
+DEFAULT_SEGFORMER_MODEL = "nvidia/segformer-b0-finetuned-ade-512-512"
+DEFAULT_MASK2FORMER_MODEL = "facebook/mask2former-swin-tiny-coco-panoptic"
 
 
 @dataclass(frozen=True)
-class PanopticCategory:
-    id: int
+class SegmentationClass:
     train_id: int
+    yolo_id: int
     name: str
+    korean_name: str
     ann_codes: tuple[int, ...]
-    isthing: bool
     color: tuple[int, int, int]
+    isthing: bool = False
 
 
-PANOPTIC_CATEGORIES: tuple[PanopticCategory, ...] = (
-    PanopticCategory(1, 1, "building", (10,), True, (220, 70, 70)),
-    PanopticCategory(2, 2, "parking_lot", (20,), False, (235, 170, 60)),
-    PanopticCategory(3, 3, "road", (30,), False, (90, 90, 90)),
-    PanopticCategory(4, 4, "street_tree", (40,), False, (80, 170, 80)),
-    PanopticCategory(5, 5, "paddy_field", (50,), False, (100, 180, 90)),
-    PanopticCategory(6, 6, "greenhouse", (55,), False, (120, 200, 185)),
-    PanopticCategory(7, 7, "field", (60,), False, (185, 155, 110)),
-    PanopticCategory(8, 8, "broadleaf_forest", (71,), False, (45, 135, 70)),
-    PanopticCategory(9, 9, "coniferous_forest", (75,), False, (30, 110, 80)),
-    PanopticCategory(10, 10, "bare_ground", (80,), False, (175, 155, 135)),
-    PanopticCategory(11, 11, "water", (95,), False, (65, 120, 200)),
-    PanopticCategory(12, 12, "non_target", (100,), False, (125, 125, 145)),
+CLASSES: tuple[SegmentationClass, ...] = (
+    SegmentationClass(1, 0, "building", "building", (10,), (220, 70, 70), True),
+    SegmentationClass(2, 1, "parking_lot", "parking_lot", (20,), (235, 170, 60)),
+    SegmentationClass(3, 2, "road", "road", (30,), (90, 90, 90)),
+    SegmentationClass(4, 3, "street_tree", "street_tree", (40,), (80, 170, 80)),
+    SegmentationClass(5, 4, "paddy_field", "paddy_field", (50,), (100, 180, 90)),
+    SegmentationClass(6, 5, "greenhouse", "greenhouse", (55,), (120, 200, 185)),
+    SegmentationClass(7, 6, "field", "field", (60,), (185, 155, 110)),
+    SegmentationClass(8, 7, "broadleaf_forest", "broadleaf_forest", (71,), (45, 135, 70)),
+    SegmentationClass(9, 8, "coniferous_forest", "coniferous_forest", (75,), (30, 110, 80)),
+    SegmentationClass(10, 9, "bare_ground", "bare_ground", (80,), (175, 155, 135)),
+    SegmentationClass(11, 10, "water", "water", (95,), (65, 120, 200)),
+    SegmentationClass(12, 11, "non_cultivated", "non_cultivated", (100,), (125, 125, 145)),
 )
 
-ANN_CODE_TO_CATEGORY_ID = {
-    ann_code: category.id
-    for category in PANOPTIC_CATEGORIES
-    for ann_code in category.ann_codes
-}
-CATEGORY_ID_TO_TRAIN_ID = {category.id: category.train_id for category in PANOPTIC_CATEGORIES}
-CATEGORY_ID_TO_NAME = {category.id: category.name for category in PANOPTIC_CATEGORIES}
-ID2LABEL = {BACKGROUND_LABEL: "background"} | {
-    category.train_id: category.name for category in PANOPTIC_CATEGORIES
-}
-LABEL2ID = {label: idx for idx, label in ID2LABEL.items()}
-NUM_CLASSES = len(ID2LABEL)
+ANN_CODE_TO_TRAIN_ID = {ann_code: item.train_id for item in CLASSES for ann_code in item.ann_codes}
+ANN_CODE_TO_YOLO_ID = {ann_code: item.yolo_id for item in CLASSES for ann_code in item.ann_codes}
+TRAIN_ID_TO_NAME = {BACKGROUND_ID: "background"} | {item.train_id: item.name for item in CLASSES}
+NAME_TO_TRAIN_ID = {name: idx for idx, name in TRAIN_ID_TO_NAME.items()}
+TRAIN_ID_TO_COLOR = {BACKGROUND_ID: (0, 0, 0)} | {item.train_id: item.color for item in CLASSES}
+YOLO_ID_TO_NAME = {item.yolo_id: item.name for item in CLASSES}
+YOLO_ID_TO_TRAIN_ID = {item.yolo_id: item.train_id for item in CLASSES}
+MASK2FORMER_ID_TO_NAME = {item.yolo_id: item.name for item in CLASSES}
+MASK2FORMER_NAME_TO_ID = {item.name: item.yolo_id for item in CLASSES}
+NUM_SEMANTIC_CLASSES = len(TRAIN_ID_TO_NAME)
+NUM_SEGMENT_CLASSES = len(CLASSES)
 
-
-def panoptic_categories_as_coco() -> list[dict[str, object]]:
-    return [
-        {
-            "id": category.id,
-            "name": category.name,
-            "isthing": int(category.isthing),
-            "color": list(category.color),
-        }
-        for category in PANOPTIC_CATEGORIES
-    ]
