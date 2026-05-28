@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,10 +19,14 @@ ROAD_LABELS = {0: "background", 1: "road"}
 DEFAULT_YOLO_SEG_MODEL = "yolo11n-seg.pt"
 CHECKPOINT_CANDIDATES = (
     "best_model.pt",
+    "last_model.pt",
     "best_sam.pt",
     "best_mask2former.pt",
+    "last_mask2former.pt",
     "best_yolo.pt",
+    "last_yolo.pt",
     "yolo/weights/best.pt",
+    "yolo/weights/last.pt",
 )
 
 
@@ -224,6 +226,29 @@ def build_yolo_model(model_name_or_path: str = DEFAULT_YOLO_SEG_MODEL) -> Any:
     return YOLO(str(resolve_checkpoint_path(model_name_or_path, required=False)))
 
 
+@dataclass
+class ModelAPI:
+    config: ModelConfig
+    module: nn.Module
+    device: torch.device = torch.device("cpu")
+
+    @classmethod
+    def create(cls, config: ModelConfig) -> "ModelAPI":
+        return cls(config=config, module=build_model(config))
+
+    def prepare_for_training(self, device_arg: str | None = None) -> "ModelAPI":
+        self.device = resolve_torch_device(device_arg)
+        self.module = self.module.to(self.device)
+        device_ids = resolve_torch_device_ids(device_arg)
+        if self.device.type == "cuda" and len(device_ids) > 1:
+            self.module = nn.DataParallel(self.module, device_ids=device_ids, output_device=device_ids[0])
+            print(f"Using DataParallel on CUDA devices: {device_ids}")
+        return self
+
+    def save(self, path: str | Path, image_size: int, metrics: dict[str, float] | None = None) -> None:
+        save_checkpoint(path, self.module, self.config, image_size, metrics)
+
+
 def resolve_checkpoint_path(path: str | Path, required: bool = True) -> Path:
     checkpoint_path = Path(path)
     if checkpoint_path.is_dir():
@@ -251,7 +276,6 @@ def save_checkpoint(
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-    temp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
     checkpoint = {
         "architecture": config.architecture,
         "model_name_or_path": config.model_name_or_path,
@@ -262,30 +286,15 @@ def save_checkpoint(
         "metrics": metrics or {},
     }
     try:
-        torch.save(checkpoint, temp_path)
+        torch.save(checkpoint, checkpoint_path)
     except (OSError, RuntimeError) as exc:
         raise RuntimeError(
-            f"Failed to write checkpoint temporary file: {temp_path.resolve()}\n"
-            f"Target checkpoint: {checkpoint_path.resolve()}\n"
+            f"Failed to write checkpoint: {checkpoint_path.resolve()}\n"
             "The output directory is not writable by this Python process, "
             "the filesystem is full, or the path is on a restricted/mounted volume. "
             "Use a writable absolute --output-dir such as /tmp/satellite_runs/road_extraction "
             "or /home/jovyan/work/thematic/runs/road_extraction."
         ) from exc
-    try:
-        temp_path.replace(checkpoint_path)
-    except OSError:
-        try:
-            shutil.copy2(temp_path, checkpoint_path)
-        except OSError as exc:
-            raise RuntimeError(
-                f"Checkpoint was written to temporary file but could not be moved to: {checkpoint_path.resolve()}\n"
-                "Check write permission, file locks, available disk space, and mounted filesystem behavior."
-            ) from exc
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def load_checkpoint(path: str, map_location: str | torch.device = "cpu") -> tuple[nn.Module, dict[str, Any]]:

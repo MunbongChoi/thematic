@@ -5,7 +5,6 @@ import json
 import os
 import random
 import shutil
-import uuid
 import warnings
 from pathlib import Path
 from typing import Callable, Iterable
@@ -21,12 +20,10 @@ from tqdm import tqdm
 from config import DEFAULT_MODEL_NAME, LABEL_CRS_EPSG, NUM_CLASSES, OUTPUT_ROOT, PANOPTIC_DATASET_DIR, panoptic_categories_as_coco
 from model import (
     DEFAULT_YOLO_SEG_MODEL,
+    ModelAPI,
     ModelConfig,
-    build_model,
     build_yolo_model,
-    resolve_torch_device,
     resolve_torch_device_ids,
-    save_checkpoint,
 )
 from panoptic import (
     category_summary,
@@ -111,21 +108,6 @@ def ensure_output_dir(path: str | Path, purpose: str = "output") -> Path:
         ) from exc
     if not output_dir.is_dir():
         raise NotADirectoryError(f"{purpose} path exists but is not a directory: {output_dir}")
-    write_test_path = output_dir / f".write_test_{os.getpid()}_{uuid.uuid4().hex}"
-    try:
-        write_test_path.write_text("ok", encoding="utf-8")
-    except OSError as exc:
-        raise PermissionError(
-            f"Cannot write to {purpose} directory: {output_dir.resolve()}\n"
-            "Use a writable absolute output path, for example:\n"
-            f"  python train.py --output-dir /tmp/satellite_runs/{output_dir.name} ...\n"
-            "or set:\n"
-            "  export SATSEG_OUTPUT_DIR=/tmp/satellite_runs/road_extraction"
-        ) from exc
-    try:
-        write_test_path.unlink()
-    except OSError:
-        pass
     return output_dir
 
 
@@ -134,16 +116,6 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def build_torch_model_for_training(config: ModelConfig, device_arg: str | None) -> tuple[nn.Module, torch.device]:
-    device = resolve_torch_device(device_arg)
-    model = build_model(config).to(device)
-    device_ids = resolve_torch_device_ids(device_arg)
-    if device.type == "cuda" and len(device_ids) > 1:
-        model = nn.DataParallel(model, device_ids=device_ids, output_device=device_ids[0])
-        print(f"Using DataParallel on CUDA devices: {device_ids}")
-    return model, device
 
 
 def parse_road_coords(value: str) -> list[tuple[float, float]]:
@@ -556,17 +528,25 @@ def train_yolo(args: argparse.Namespace) -> None:
     if args.device:
         train_kwargs["device"] = args.device
     results = model.train(**train_kwargs)
-    best_candidates = [output_dir / "yolo" / "weights" / "best.pt"]
     save_dir = getattr(results, "save_dir", None) or getattr(getattr(model, "trainer", None), "save_dir", None)
-    if save_dir is not None:
-        best_candidates.insert(0, Path(save_dir) / "weights" / "best.pt")
-    for best_path in best_candidates:
-        if best_path.exists():
-            shutil.copy2(best_path, output_dir / "best_yolo.pt")
-            break
-    else:
-        searched = ", ".join(str(path) for path in best_candidates)
-        raise FileNotFoundError(f"YOLO training finished but best.pt was not found. Searched: {searched}")
+    weights_dir = Path(save_dir) / "weights" if save_dir is not None else output_dir / "yolo" / "weights"
+    checkpoint_pairs = (
+        (weights_dir / "best.pt", output_dir / "best_yolo.pt"),
+        (weights_dir / "last.pt", output_dir / "last_yolo.pt"),
+    )
+    missing: list[str] = []
+    for source_path, target_path in checkpoint_pairs:
+        if source_path.exists():
+            shutil.copy2(source_path, target_path)
+        else:
+            missing.append(str(source_path))
+    if missing:
+        raise FileNotFoundError(f"YOLO training finished but checkpoint(s) were not found: {', '.join(missing)}")
+
+    # Keep only the public best/last checkpoints in the selected output directory.
+    for source_path, target_path in checkpoint_pairs:
+        if source_path.resolve() != target_path.resolve():
+            source_path.unlink(missing_ok=True)
 
     result_dict = getattr(results, "results_dict", None)
     print(json.dumps(result_dict, indent=2) if result_dict else results)
@@ -733,19 +713,17 @@ def train_panoptic(args: argparse.Namespace) -> None:
             "Mask2Former training does not support --device with multiple GPUs in this script. "
             "Use a single device such as --device 0, or add a torchrun/DDP training path."
         )
-    model, device = build_torch_model_for_training(model_config, args.device)
+    model_api = ModelAPI.create(model_config).prepare_for_training(args.device)
     train_model_loop(
-        model=model,
+        model_api=model_api,
         train_loader=train_loader,
         valid_loader=valid_loader,
-        device=device,
         args=args,
-        model_config=model_config,
         epoch_runner=run_panoptic_epoch,
-        checkpoint_name="best_mask2former.pt",
+        best_checkpoint_name="best_mask2former.pt",
+        last_checkpoint_name="last_mask2former.pt",
         monitor_metric="loss",
         maximize=False,
-        pretrained_subdir="mask2former_model",
     )
 
 
@@ -878,30 +856,20 @@ def run_epoch(
     return results
 
 
-def unwrapped_model(model: nn.Module) -> nn.Module:
-    return model.module if isinstance(model, nn.DataParallel) else model
-
-
-def save_pretrained_model(model: nn.Module, output_dir: Path, subdir: str) -> None:
-    model_to_save = unwrapped_model(model)
-    if hasattr(model_to_save, "save_pretrained"):
-        model_to_save.save_pretrained(output_dir / subdir)
-
-
 def train_model_loop(
-    model: nn.Module,
+    model_api: ModelAPI,
     train_loader: DataLoader,
     valid_loader: DataLoader,
-    device: torch.device,
     args: argparse.Namespace,
-    model_config: ModelConfig,
     epoch_runner: Callable[[nn.Module, DataLoader, torch.device, torch.optim.Optimizer | None], dict[str, float]],
-    checkpoint_name: str,
+    best_checkpoint_name: str,
+    last_checkpoint_name: str,
     monitor_metric: str,
     maximize: bool,
-    pretrained_subdir: str | None = None,
 ) -> None:
     output_dir = ensure_output_dir(args.output_dir, "training output")
+    model = model_api.module
+    device = model_api.device
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_value = -float("inf") if maximize else float("inf")
     history: list[dict[str, object]] = []
@@ -913,13 +881,12 @@ def train_model_loop(
         history.append(row)
         print(json.dumps(row, indent=2))
 
+        model_api.save(output_dir / last_checkpoint_name, args.image_size, valid_metrics)
         current_value = valid_metrics[monitor_metric]
         improved = current_value > best_value if maximize else current_value < best_value
         if improved:
             best_value = current_value
-            save_checkpoint(str(output_dir / checkpoint_name), model, model_config, args.image_size, valid_metrics)
-            if pretrained_subdir:
-                save_pretrained_model(model, output_dir, pretrained_subdir)
+            model_api.save(output_dir / best_checkpoint_name, args.image_size, valid_metrics)
 
     with (output_dir / "history.json").open("w", encoding="utf-8") as file:
         json.dump(history, file, indent=2)
@@ -928,21 +895,18 @@ def train_model_loop(
 def train_semantic(args: argparse.Namespace) -> None:
     train_loader, valid_loader = make_dataloaders(args)
     config = ModelConfig(architecture=args.architecture, model_name_or_path=args.model_name_or_path)
-    model, device = build_torch_model_for_training(config, args.device)
-    pretrained_subdir = "hf_model" if args.architecture == "segformer" else None
+    model_api = ModelAPI.create(config).prepare_for_training(args.device)
     semantic_epoch = lambda m, l, d, o=None: run_epoch(m, l, args.architecture, d, o)
     train_model_loop(
-        model=model,
+        model_api=model_api,
         train_loader=train_loader,
         valid_loader=valid_loader,
-        device=device,
         args=args,
-        model_config=config,
         epoch_runner=semantic_epoch,
-        checkpoint_name="best_model.pt",
+        best_checkpoint_name="best_model.pt",
+        last_checkpoint_name="last_model.pt",
         monitor_metric="iou",
         maximize=True,
-        pretrained_subdir=pretrained_subdir,
     )
 
 

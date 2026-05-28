@@ -133,7 +133,7 @@ python train.py --architecture yolo --model-name-or-path yolo11n-seg.pt --device
 
 For YOLO, the training script converts JSON road polygons into Ultralytics
 segmentation labels under `runs/road_extraction/yolo_dataset`.
-The best checkpoint is copied to `runs/road_extraction/best_yolo.pt`.
+Only the public final checkpoints are kept: `best_yolo.pt` and `last_yolo.pt`.
 
 ## Train with Mask2Former panoptic segmentation
 
@@ -166,8 +166,8 @@ python test.py --architecture mask2former --checkpoint runs/panoptic_segmentatio
 `--checkpoint` normally points to a checkpoint file, not only a run directory.
 For example, use `runs/road_extraction/best_model.pt` instead of
 `runs/road_extraction`. If a run directory is provided, the code tries to find
-one of `best_model.pt`, `best_sam.pt`, `best_mask2former.pt`,
-`best_yolo.pt`, or `yolo/weights/best.pt` inside it.
+one of `best_model.pt`, `last_model.pt`, `best_mask2former.pt`,
+`last_mask2former.pt`, `best_yolo.pt`, or `last_yolo.pt` inside it.
 
 
 ## Inference
