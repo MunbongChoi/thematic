@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,42 +66,10 @@ def cuda_diagnostic_message(requested_device: str) -> str:
     return "\n".join(details)
 
 
-def resolve_torch_device(device: str | None = None) -> torch.device:
-    if device is None or device == "":
-        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    normalized = str(device).strip().lower()
-    if normalized == "cpu":
-        return torch.device("cpu")
-    if "," in normalized:
-        first_device = normalized.split(",", maxsplit=1)[0].strip()
-        normalized = first_device
-    if normalized.isdigit():
-        if not torch.cuda.is_available():
-            raise RuntimeError(cuda_diagnostic_message(normalized))
-        index = int(normalized)
-        if index >= torch.cuda.device_count():
-            raise RuntimeError(f"CUDA device index {index} is unavailable. Found {torch.cuda.device_count()} CUDA device(s).")
-        return torch.device(f"cuda:{index}")
-    if normalized == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError(cuda_diagnostic_message(normalized))
-        return torch.device("cuda:0")
-    if normalized.startswith("cuda:"):
-        if not torch.cuda.is_available():
-            raise RuntimeError(cuda_diagnostic_message(normalized))
-        try:
-            index = int(normalized.split(":", maxsplit=1)[1])
-        except ValueError as exc:
-            raise ValueError(f"Invalid CUDA device string: {device!r}. Use '0', 'cuda', or 'cuda:0'.") from exc
-        if index >= torch.cuda.device_count():
-            raise RuntimeError(f"CUDA device index {index} is unavailable. Found {torch.cuda.device_count()} CUDA device(s).")
-    return torch.device(normalized)
-
-
 def resolve_torch_device_ids(device: str | None = None) -> list[int]:
-    if device is None or str(device).strip() == "" or str(device).strip().lower() == "cuda":
+    normalized = "" if device is None else str(device).strip().lower()
+    if normalized in {"", "cuda"}:
         return [0] if torch.cuda.is_available() else []
-    normalized = str(device).strip().lower()
     if normalized == "cpu":
         return []
     raw_ids = normalized.replace("cuda:", "").split(",")
@@ -120,6 +89,21 @@ def resolve_torch_device_ids(device: str | None = None) -> list[int]:
     if invalid:
         raise RuntimeError(f"CUDA device index(es) {invalid} unavailable. Found {available} CUDA device(s).")
     return device_ids
+
+
+def resolve_torch_device(device: str | None = None) -> torch.device:
+    normalized = "" if device is None else str(device).strip().lower()
+    if normalized == "cpu":
+        return torch.device("cpu")
+    if normalized and not (normalized == "cuda" or normalized.startswith("cuda:") or normalized[0].isdigit()):
+        return torch.device(normalized)
+
+    device_ids = resolve_torch_device_ids(device)
+    if device_ids:
+        return torch.device(f"cuda:{device_ids[0]}")
+    if normalized:
+        raise RuntimeError(cuda_diagnostic_message(normalized))
+    return torch.device("cpu")
 
 
 class ConvBlock(nn.Module):
@@ -267,26 +251,40 @@ def save_checkpoint(
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-    temp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + f".{os.getpid()}.tmp")
-    torch.save(
-        {
-            "architecture": config.architecture,
-            "model_name_or_path": config.model_name_or_path,
-            "num_labels": config.num_labels,
-            "image_size": image_size,
-            "state_dict": model_to_save.state_dict(),
-            "id2label": PANOPTIC_LABELS if config.architecture in {"mask2former", "panoptic"} else ROAD_LABELS,
-            "metrics": metrics or {},
-        },
-        temp_path,
-    )
+    temp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    checkpoint = {
+        "architecture": config.architecture,
+        "model_name_or_path": config.model_name_or_path,
+        "num_labels": config.num_labels,
+        "image_size": image_size,
+        "state_dict": model_to_save.state_dict(),
+        "id2label": PANOPTIC_LABELS if config.architecture in {"mask2former", "panoptic"} else ROAD_LABELS,
+        "metrics": metrics or {},
+    }
+    try:
+        torch.save(checkpoint, temp_path)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"Failed to write checkpoint temporary file: {temp_path.resolve()}\n"
+            f"Target checkpoint: {checkpoint_path.resolve()}\n"
+            "The output directory is not writable by this Python process, "
+            "the filesystem is full, or the path is on a restricted/mounted volume. "
+            "Use a writable absolute --output-dir such as /tmp/satellite_runs/road_extraction "
+            "or /home/jovyan/work/thematic/runs/road_extraction."
+        ) from exc
     try:
         temp_path.replace(checkpoint_path)
-    except PermissionError:
-        shutil.copy2(temp_path, checkpoint_path)
+    except OSError:
+        try:
+            shutil.copy2(temp_path, checkpoint_path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Checkpoint was written to temporary file but could not be moved to: {checkpoint_path.resolve()}\n"
+                "Check write permission, file locks, available disk space, and mounted filesystem behavior."
+            ) from exc
         try:
             temp_path.unlink(missing_ok=True)
-        except PermissionError:
+        except OSError:
             pass
 
 

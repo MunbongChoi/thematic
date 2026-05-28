@@ -5,9 +5,10 @@ import json
 import os
 import random
 import shutil
+import uuid
 import warnings
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import torch
@@ -110,6 +111,21 @@ def ensure_output_dir(path: str | Path, purpose: str = "output") -> Path:
         ) from exc
     if not output_dir.is_dir():
         raise NotADirectoryError(f"{purpose} path exists but is not a directory: {output_dir}")
+    write_test_path = output_dir / f".write_test_{os.getpid()}_{uuid.uuid4().hex}"
+    try:
+        write_test_path.write_text("ok", encoding="utf-8")
+    except OSError as exc:
+        raise PermissionError(
+            f"Cannot write to {purpose} directory: {output_dir.resolve()}\n"
+            "Use a writable absolute output path, for example:\n"
+            f"  python train.py --output-dir /tmp/satellite_runs/{output_dir.name} ...\n"
+            "or set:\n"
+            "  export SATSEG_OUTPUT_DIR=/tmp/satellite_runs/road_extraction"
+        ) from exc
+    try:
+        write_test_path.unlink()
+    except OSError:
+        pass
     return output_dir
 
 
@@ -405,14 +421,47 @@ def collect_samples(split_dir: Path, limit: int | None = None) -> list[tuple[Pat
     return [(find_image_for_label(image_dir, label_path, image_index), label_path) for label_path in label_paths]
 
 
+def has_labeled_split(split_dir: Path) -> bool:
+    return (split_dir / "image").exists() and (split_dir / "label").exists() and any((split_dir / "label").rglob("*.json"))
+
+
+def split_dataset_for_validation(dataset: Dataset, args: argparse.Namespace) -> tuple[Dataset, Dataset]:
+    if len(dataset) < 2:
+        raise ValueError("At least two training samples are required when dataset/valid is unavailable.")
+    val_size = max(1, int(len(dataset) * args.val_ratio))
+    if val_size >= len(dataset):
+        val_size = len(dataset) - 1
+    train_size = len(dataset) - val_size
+    return random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(args.seed),
+    )
+
+
+def make_loader(
+    dataset: Dataset,
+    args: argparse.Namespace,
+    *,
+    shuffle: bool,
+    collate_fn: Callable[[list], object],
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+    )
+
+
 def split_samples(args: argparse.Namespace) -> tuple[list[tuple[Path, Path]], list[tuple[Path, Path]]]:
     if not 0.0 < args.val_ratio < 1.0:
         raise ValueError("--val-ratio must be between 0 and 1.")
     dataset_root = Path(args.dataset_root)
     train_samples = collect_samples(dataset_root / "train", args.limit)
     valid_dir = dataset_root / "valid"
-    has_valid = (valid_dir / "image").exists() and (valid_dir / "label").exists() and any((valid_dir / "label").rglob("*.json"))
-    if has_valid:
+    if has_labeled_split(valid_dir):
         return train_samples, collect_samples(valid_dir, args.limit)
 
     rng = random.Random(args.seed)
@@ -625,37 +674,14 @@ def make_panoptic_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, Dat
     dataset_root = Path(args.dataset_root)
     train_dataset = PanopticSegmentationDataset(dataset_root / "train", args.image_size, args.limit)
     valid_dir = dataset_root / "valid"
-    has_valid = (valid_dir / "image").exists() and (valid_dir / "label").exists() and any((valid_dir / "label").rglob("*.json"))
-    if has_valid:
+    if has_labeled_split(valid_dir):
         valid_dataset = PanopticSegmentationDataset(valid_dir, args.image_size, args.limit)
     else:
-        if len(train_dataset) < 2:
-            raise ValueError("At least two training samples are required when dataset/valid is unavailable.")
-        val_size = max(1, int(len(train_dataset) * args.val_ratio))
-        if val_size >= len(train_dataset):
-            val_size = len(train_dataset) - 1
-        train_size = len(train_dataset) - val_size
-        train_dataset, valid_dataset = random_split(
-            train_dataset,
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(args.seed),
-        )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_panoptic_batch,
+        train_dataset, valid_dataset = split_dataset_for_validation(train_dataset, args)
+    return (
+        make_loader(train_dataset, args, shuffle=True, collate_fn=collate_panoptic_batch),
+        make_loader(valid_dataset, args, shuffle=False, collate_fn=collate_panoptic_batch),
     )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_panoptic_batch,
-    )
-    return train_loader, valid_loader
 
 
 def run_panoptic_epoch(
@@ -689,8 +715,8 @@ def run_panoptic_epoch(
 
 
 def train_panoptic(args: argparse.Namespace) -> None:
-    output_dir = OUTPUT_ROOT if args.output_dir == "runs/road_extraction" else Path(args.output_dir)
-    output_dir = ensure_output_dir(output_dir, "Mask2Former output")
+    if args.output_dir == DEFAULT_OUTPUT_DIR:
+        args.output_dir = str(OUTPUT_ROOT)
     if args.export_panoptic_only:
         path = prepare_panoptic_dataset(args, Path(args.panoptic_data_dir))
         print(f"Exported COCO panoptic dataset to {path}")
@@ -708,26 +734,19 @@ def train_panoptic(args: argparse.Namespace) -> None:
             "Use a single device such as --device 0, or add a torchrun/DDP training path."
         )
     model, device = build_torch_model_for_training(model_config, args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    best_loss = float("inf")
-    history: list[dict[str, object]] = []
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = run_panoptic_epoch(model, train_loader, device, optimizer)
-        valid_metrics = run_panoptic_epoch(model, valid_loader, device)
-        row = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics}
-        history.append(row)
-        print(json.dumps(row, indent=2))
-
-        if valid_metrics["loss"] < best_loss:
-            best_loss = valid_metrics["loss"]
-            save_checkpoint(str(output_dir / "best_mask2former.pt"), model, model_config, args.image_size, valid_metrics)
-            model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-            if hasattr(model_to_save, "save_pretrained"):
-                model_to_save.save_pretrained(output_dir / "mask2former_model")
-
-    with (output_dir / "history.json").open("w", encoding="utf-8") as file:
-        json.dump(history, file, indent=2)
+    train_model_loop(
+        model=model,
+        train_loader=train_loader,
+        valid_loader=valid_loader,
+        device=device,
+        args=args,
+        model_config=model_config,
+        epoch_runner=run_panoptic_epoch,
+        checkpoint_name="best_mask2former.pt",
+        monitor_metric="loss",
+        maximize=False,
+        pretrained_subdir="mask2former_model",
+    )
 
 
 class RoadSegmentationDataset(Dataset):
@@ -778,37 +797,14 @@ def make_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     train_dataset = RoadSegmentationDataset(dataset_root / "train", args.image_size, args.limit, target_ann_codes)
 
     valid_dir = dataset_root / "valid"
-    has_valid = (valid_dir / "image").exists() and (valid_dir / "label").exists() and any((valid_dir / "label").rglob("*.json"))
-    if has_valid:
+    if has_labeled_split(valid_dir):
         valid_dataset = RoadSegmentationDataset(valid_dir, args.image_size, args.limit, target_ann_codes)
     else:
-        if len(train_dataset) < 2:
-            raise ValueError("At least two training samples are required when dataset/valid is unavailable.")
-        val_size = max(1, int(len(train_dataset) * args.val_ratio))
-        if val_size >= len(train_dataset):
-            val_size = len(train_dataset) - 1
-        train_size = len(train_dataset) - val_size
-        train_dataset, valid_dataset = random_split(
-            train_dataset,
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(args.seed),
-        )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_batch,
+        train_dataset, valid_dataset = split_dataset_for_validation(train_dataset, args)
+    return (
+        make_loader(train_dataset, args, shuffle=True, collate_fn=collate_batch),
+        make_loader(valid_dataset, args, shuffle=False, collate_fn=collate_batch),
     )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_batch,
-    )
-    return train_loader, valid_loader
 
 
 def logits_from_model(model: nn.Module, architecture: str, images: torch.Tensor, labels: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -882,31 +878,72 @@ def run_epoch(
     return results
 
 
-def train_semantic(args: argparse.Namespace) -> None:
-    output_dir = ensure_output_dir(args.output_dir, "training output")
-    train_loader, valid_loader = make_dataloaders(args)
-    config = ModelConfig(architecture=args.architecture, model_name_or_path=args.model_name_or_path)
-    model, device = build_torch_model_for_training(config, args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+def unwrapped_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, nn.DataParallel) else model
 
-    best_iou = -1.0
+
+def save_pretrained_model(model: nn.Module, output_dir: Path, subdir: str) -> None:
+    model_to_save = unwrapped_model(model)
+    if hasattr(model_to_save, "save_pretrained"):
+        model_to_save.save_pretrained(output_dir / subdir)
+
+
+def train_model_loop(
+    model: nn.Module,
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    device: torch.device,
+    args: argparse.Namespace,
+    model_config: ModelConfig,
+    epoch_runner: Callable[[nn.Module, DataLoader, torch.device, torch.optim.Optimizer | None], dict[str, float]],
+    checkpoint_name: str,
+    monitor_metric: str,
+    maximize: bool,
+    pretrained_subdir: str | None = None,
+) -> None:
+    output_dir = ensure_output_dir(args.output_dir, "training output")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    best_value = -float("inf") if maximize else float("inf")
     history: list[dict[str, object]] = []
+
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, args.architecture, device, optimizer)
-        valid_metrics = run_epoch(model, valid_loader, args.architecture, device)
+        train_metrics = epoch_runner(model, train_loader, device, optimizer)
+        valid_metrics = epoch_runner(model, valid_loader, device, None)
         row = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics}
         history.append(row)
         print(json.dumps(row, indent=2))
 
-        if valid_metrics["iou"] > best_iou:
-            best_iou = valid_metrics["iou"]
-            save_checkpoint(str(output_dir / "best_model.pt"), model, config, args.image_size, valid_metrics)
-            model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-            if args.architecture == "segformer" and hasattr(model_to_save, "save_pretrained"):
-                model_to_save.save_pretrained(output_dir / "hf_model")
+        current_value = valid_metrics[monitor_metric]
+        improved = current_value > best_value if maximize else current_value < best_value
+        if improved:
+            best_value = current_value
+            save_checkpoint(str(output_dir / checkpoint_name), model, model_config, args.image_size, valid_metrics)
+            if pretrained_subdir:
+                save_pretrained_model(model, output_dir, pretrained_subdir)
 
     with (output_dir / "history.json").open("w", encoding="utf-8") as file:
         json.dump(history, file, indent=2)
+
+
+def train_semantic(args: argparse.Namespace) -> None:
+    train_loader, valid_loader = make_dataloaders(args)
+    config = ModelConfig(architecture=args.architecture, model_name_or_path=args.model_name_or_path)
+    model, device = build_torch_model_for_training(config, args.device)
+    pretrained_subdir = "hf_model" if args.architecture == "segformer" else None
+    semantic_epoch = lambda m, l, d, o=None: run_epoch(m, l, args.architecture, d, o)
+    train_model_loop(
+        model=model,
+        train_loader=train_loader,
+        valid_loader=valid_loader,
+        device=device,
+        args=args,
+        model_config=config,
+        epoch_runner=semantic_epoch,
+        checkpoint_name="best_model.pt",
+        monitor_metric="iou",
+        maximize=True,
+        pretrained_subdir=pretrained_subdir,
+    )
 
 
 TRAIN_DISPATCH = {
