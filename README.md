@@ -96,6 +96,14 @@ python train.py --architecture segformer
 python train.py --architecture segformer --epochs 20 --batch-size 4 --image-size 512
 ```
 
+For multi-GPU SegFormer or UNet training, pass a comma-separated CUDA device
+list. This script uses PyTorch `DataParallel` for these semantic segmentation
+models:
+
+```bash
+python train.py --architecture segformer --device 0,1,2,3 --epochs 20 --batch-size 16 --image-size 512
+```
+
 Use `--target-ann-codes` to change which `ANN_CD` values are treated as road:
 
 ```bash
@@ -117,6 +125,12 @@ python train.py --architecture unet --epochs 50 --batch-size 8 --image-size 512
 python train.py --architecture yolo --model-name-or-path yolo11n-seg.pt --epochs 50 --batch-size 8 --image-size 640
 ```
 
+YOLO multi-GPU training is handled by Ultralytics:
+
+```bash
+python train.py --architecture yolo --model-name-or-path yolo11n-seg.pt --device 0,1,2,3 --epochs 50 --batch-size 32 --image-size 640
+```
+
 For YOLO, the training script converts JSON road polygons into Ultralytics
 segmentation labels under `runs/road_extraction/yolo_dataset`.
 The best checkpoint is copied to `runs/road_extraction/best_yolo.pt`.
@@ -126,6 +140,10 @@ The best checkpoint is copied to `runs/road_extraction/best_yolo.pt`.
 ```bash
 python train.py --architecture mask2former --output-dir runs/panoptic_segmentation --epochs 20 --batch-size 2 --image-size 512
 ```
+
+Mask2Former training currently supports one GPU in this script. Use
+`--device 0`. Multi-GPU Mask2Former needs a dedicated `torchrun`/DDP training
+path because each sample has variable-length instance masks.
 
 The panoptic path preserves all observed `ANN_CD` classes:
 `10,20,30,40,50,55,60,71,75,80,95,100`. `ANN_CD=10` is treated as

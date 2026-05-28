@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +95,31 @@ def resolve_torch_device(device: str | None = None) -> torch.device:
         if index >= torch.cuda.device_count():
             raise RuntimeError(f"CUDA device index {index} is unavailable. Found {torch.cuda.device_count()} CUDA device(s).")
     return torch.device(normalized)
+
+
+def resolve_torch_device_ids(device: str | None = None) -> list[int]:
+    if device is None or str(device).strip() == "" or str(device).strip().lower() == "cuda":
+        return [0] if torch.cuda.is_available() else []
+    normalized = str(device).strip().lower()
+    if normalized == "cpu":
+        return []
+    raw_ids = normalized.replace("cuda:", "").split(",")
+    device_ids: list[int] = []
+    for raw_id in raw_ids:
+        raw_id = raw_id.strip()
+        if not raw_id:
+            continue
+        try:
+            device_ids.append(int(raw_id))
+        except ValueError as exc:
+            raise ValueError(f"Invalid CUDA device list: {device!r}. Use '0' or '0,1,2,3'.") from exc
+    if device_ids and not torch.cuda.is_available():
+        raise RuntimeError(cuda_diagnostic_message(str(device)))
+    available = torch.cuda.device_count()
+    invalid = [idx for idx in device_ids if idx < 0 or idx >= available]
+    if invalid:
+        raise RuntimeError(f"CUDA device index(es) {invalid} unavailable. Found {available} CUDA device(s).")
+    return device_ids
 
 
 class ConvBlock(nn.Module):
@@ -238,23 +264,42 @@ def save_checkpoint(
     image_size: int,
     metrics: dict[str, float] | None = None,
 ) -> None:
+    checkpoint_path = Path(path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+    temp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + f".{os.getpid()}.tmp")
     torch.save(
         {
             "architecture": config.architecture,
             "model_name_or_path": config.model_name_or_path,
             "num_labels": config.num_labels,
             "image_size": image_size,
-            "state_dict": model.state_dict(),
+            "state_dict": model_to_save.state_dict(),
             "id2label": PANOPTIC_LABELS if config.architecture in {"mask2former", "panoptic"} else ROAD_LABELS,
             "metrics": metrics or {},
         },
-        path,
+        temp_path,
     )
+    try:
+        temp_path.replace(checkpoint_path)
+    except PermissionError:
+        shutil.copy2(temp_path, checkpoint_path)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except PermissionError:
+            pass
 
 
 def load_checkpoint(path: str, map_location: str | torch.device = "cpu") -> tuple[nn.Module, dict[str, Any]]:
     checkpoint_path = resolve_checkpoint_path(path)
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to open checkpoint: {checkpoint_path.resolve()}. "
+            "Check that the file exists, is not empty, and is readable. "
+            "If training was interrupted while saving, delete the partial file and train again."
+        ) from exc
     config = ModelConfig(
         architecture=checkpoint["architecture"],
         model_name_or_path=checkpoint["model_name_or_path"],

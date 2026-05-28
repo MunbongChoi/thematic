@@ -18,7 +18,15 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 
 from config import DEFAULT_MODEL_NAME, LABEL_CRS_EPSG, NUM_CLASSES, OUTPUT_ROOT, PANOPTIC_DATASET_DIR, panoptic_categories_as_coco
-from model import DEFAULT_YOLO_SEG_MODEL, ModelConfig, build_model, build_yolo_model, resolve_torch_device, save_checkpoint
+from model import (
+    DEFAULT_YOLO_SEG_MODEL,
+    ModelConfig,
+    build_model,
+    build_yolo_model,
+    resolve_torch_device,
+    resolve_torch_device_ids,
+    save_checkpoint,
+)
 from panoptic import (
     category_summary,
     masks_and_classes_from_panoptic,
@@ -110,6 +118,16 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def build_torch_model_for_training(config: ModelConfig, device_arg: str | None) -> tuple[nn.Module, torch.device]:
+    device = resolve_torch_device(device_arg)
+    model = build_model(config).to(device)
+    device_ids = resolve_torch_device_ids(device_arg)
+    if device.type == "cuda" and len(device_ids) > 1:
+        model = nn.DataParallel(model, device_ids=device_ids, output_device=device_ids[0])
+        print(f"Using DataParallel on CUDA devices: {device_ids}")
+    return model, device
 
 
 def parse_road_coords(value: str) -> list[tuple[float, float]]:
@@ -678,13 +696,18 @@ def train_panoptic(args: argparse.Namespace) -> None:
         print(f"Exported COCO panoptic dataset to {path}")
         return
 
-    device = resolve_torch_device(args.device)
     train_loader, valid_loader = make_panoptic_dataloaders(args)
     model_name = args.model_name_or_path
     if model_name == "nvidia/segformer-b0-finetuned-ade-512-512":
         model_name = DEFAULT_MODEL_NAME
     model_config = ModelConfig(architecture="mask2former", model_name_or_path=model_name, num_labels=NUM_CLASSES)
-    model = build_model(model_config).to(device)
+    device_ids = resolve_torch_device_ids(args.device)
+    if len(device_ids) > 1:
+        raise ValueError(
+            "Mask2Former training does not support --device with multiple GPUs in this script. "
+            "Use a single device such as --device 0, or add a torchrun/DDP training path."
+        )
+    model, device = build_torch_model_for_training(model_config, args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_loss = float("inf")
@@ -699,8 +722,9 @@ def train_panoptic(args: argparse.Namespace) -> None:
         if valid_metrics["loss"] < best_loss:
             best_loss = valid_metrics["loss"]
             save_checkpoint(str(output_dir / "best_mask2former.pt"), model, model_config, args.image_size, valid_metrics)
-            if hasattr(model, "save_pretrained"):
-                model.save_pretrained(output_dir / "mask2former_model")
+            model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+            if hasattr(model_to_save, "save_pretrained"):
+                model_to_save.save_pretrained(output_dir / "mask2former_model")
 
     with (output_dir / "history.json").open("w", encoding="utf-8") as file:
         json.dump(history, file, indent=2)
@@ -860,10 +884,9 @@ def run_epoch(
 
 def train_semantic(args: argparse.Namespace) -> None:
     output_dir = ensure_output_dir(args.output_dir, "training output")
-    device = resolve_torch_device(args.device)
     train_loader, valid_loader = make_dataloaders(args)
     config = ModelConfig(architecture=args.architecture, model_name_or_path=args.model_name_or_path)
-    model = build_model(config).to(device)
+    model, device = build_torch_model_for_training(config, args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_iou = -1.0
@@ -878,8 +901,9 @@ def train_semantic(args: argparse.Namespace) -> None:
         if valid_metrics["iou"] > best_iou:
             best_iou = valid_metrics["iou"]
             save_checkpoint(str(output_dir / "best_model.pt"), model, config, args.image_size, valid_metrics)
-            if args.architecture == "segformer" and hasattr(model, "save_pretrained"):
-                model.save_pretrained(output_dir / "hf_model")
+            model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+            if args.architecture == "segformer" and hasattr(model_to_save, "save_pretrained"):
+                model_to_save.save_pretrained(output_dir / "hf_model")
 
     with (output_dir / "history.json").open("w", encoding="utf-8") as file:
         json.dump(history, file, indent=2)
