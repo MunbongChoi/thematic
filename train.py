@@ -60,7 +60,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers. For YOLO DDP this is per GPU process.")
+    parser.add_argument("--yolo-cache", default="ram", choices=["false", "ram", "disk"], help="Ultralytics image cache mode for YOLO.")
+    parser.add_argument("--yolo-amp", action=argparse.BooleanOptionalAction, default=True, help="Enable Ultralytics AMP for YOLO.")
     parser.add_argument("--device", default=None, help="Use cpu, 0, cuda:0, or 0,1 where supported.")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--limit", type=int, default=None, help="Optional sample limit for smoke tests.")
@@ -649,6 +651,12 @@ def normalize_yolo_device(device: str | None) -> str | None:
     return normalized.replace("cuda:", "")
 
 
+def normalize_yolo_cache(cache_mode: str) -> bool | str:
+    if cache_mode == "false":
+        return False
+    return cache_mode
+
+
 def train_yolo(args: argparse.Namespace) -> None:
     arch_output_dir = ensure_dir(Path(args.output_dir) / "yolo")
     data_yaml = prepare_yolo_dataset(args)
@@ -664,10 +672,19 @@ def train_yolo(args: argparse.Namespace) -> None:
         "name": "train",
         "exist_ok": True,
         "workers": args.num_workers,
+        "cache": normalize_yolo_cache(args.yolo_cache),
+        "amp": args.yolo_amp,
     }
     yolo_device = normalize_yolo_device(args.device)
     if yolo_device:
         train_kwargs["device"] = yolo_device
+    print(
+        "YOLO training config: "
+        f"device={train_kwargs.get('device', 'auto')}, "
+        f"batch={args.batch_size}, workers={args.num_workers}, "
+        f"cache={train_kwargs['cache']}, amp={args.yolo_amp}, "
+        f"torch_cuda={torch.cuda.is_available()}, cuda_count={torch.cuda.device_count()}"
+    )
     results = model.train(**train_kwargs)
     save_dir = Path(getattr(results, "save_dir", arch_output_dir / "train"))
     weights_dir = save_dir / "weights"
