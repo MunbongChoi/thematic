@@ -34,7 +34,7 @@ BACKGROUND_ID = 0
 DEFAULT_IMAGE_SIZE = 512
 DEFAULT_SEED = 42
 
-DEFAULT_YOLO_MODEL = "yolo11n-seg.pt"
+DEFAULT_YOLO_MODEL = "yolo26n-seg.pt"
 DEFAULT_MASK2FORMER_MODEL = "facebook/mask2former-swin-tiny-coco-panoptic"
 DEFAULT_SAMGEO_MODEL_TYPE = "vit_h"
 
