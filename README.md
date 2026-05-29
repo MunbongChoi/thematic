@@ -49,6 +49,17 @@ python train.py --architecture yolo --dataset-root dataset --output-dir runs/seg
 python train.py --architecture mask2former --dataset-root dataset --output-dir runs/segmentation --epochs 50
 ```
 
+Train with multiple GPUs:
+
+```powershell
+python train.py --architecture all --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 8 --device 0,1
+python train.py --architecture mask2former --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 4 --device 0,1
+```
+
+YOLO receives the multi-GPU device list directly. UNet and SegFormer use
+PyTorch `DataParallel`. Mask2Former uses a custom parallel wrapper so each
+image keeps the correct per-image `mask_labels` and `class_labels`.
+
 Each trained model writes:
 
 - `runs/segmentation/<architecture>/best.pt`

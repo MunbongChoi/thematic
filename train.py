@@ -39,7 +39,7 @@ from config import (
     TRAIN_ID_TO_NAME,
     YOLO_ID_TO_NAME,
 )
-from model import ModelAPI, ModelConfig, build_yolo_model, resolve_torch_device_ids
+from model import Mask2FormerDataParallel, ModelAPI, ModelConfig, build_yolo_model
 
 IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -540,8 +540,12 @@ def run_mask2former_epoch(
     with torch.set_grad_enabled(is_train):
         for batch in tqdm(loader, leave=False):
             images = batch["pixel_values"].to(device)
-            mask_labels = [mask.to(device) for mask in batch["mask_labels"]]
-            class_labels = [labels.to(device) for labels in batch["class_labels"]]
+            if isinstance(model, Mask2FormerDataParallel):
+                mask_labels = batch["mask_labels"]
+                class_labels = batch["class_labels"]
+            else:
+                mask_labels = [mask.to(device) for mask in batch["mask_labels"]]
+                class_labels = [labels.to(device) for labels in batch["class_labels"]]
             outputs = model(pixel_values=images, mask_labels=mask_labels, class_labels=class_labels)
             loss = outputs.loss
             if loss is None:
@@ -565,10 +569,6 @@ def train_torch_model(
 ) -> None:
     arch_output_dir = ensure_dir(Path(args.output_dir) / architecture)
     config = ModelConfig(architecture=architecture, model_name_or_path=args.model_name_or_path).normalized()
-    if architecture == "mask2former":
-        device_ids = resolve_torch_device_ids(args.device)
-        if len(device_ids) > 1:
-            raise ValueError("Mask2Former training in this script supports one CUDA device. Use --device 0 or --device cpu.")
     model_api = ModelAPI.create(config).prepare_for_training(args.device)
     optimizer = torch.optim.AdamW(model_api.module.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_value = -float("inf") if maximize else float("inf")

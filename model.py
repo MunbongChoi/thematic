@@ -4,6 +4,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np  # noqa: F401
@@ -211,6 +212,57 @@ def build_yolo_model(model_name_or_path: str | Path | None = None) -> Any:
     return YOLO(str(model_name_or_path or DEFAULT_YOLO_MODEL))
 
 
+class Mask2FormerDataParallel(nn.Module):
+    """DataParallel wrapper that keeps per-image mask targets aligned.
+
+    Hugging Face Mask2Former receives `mask_labels` and `class_labels` as lists
+    with one item per image. PyTorch's generic DataParallel recursively scatters
+    list items, which can split an instance-mask tensor along the wrong axis.
+    This wrapper slices those lists by image batch before dispatching replicas.
+    """
+
+    def __init__(self, module: nn.Module, device_ids: list[int], output_device: int | None = None) -> None:
+        super().__init__()
+        if len(device_ids) < 2:
+            raise ValueError("Mask2FormerDataParallel requires at least two CUDA devices.")
+        self.module = module
+        self.device_ids = device_ids
+        self.output_device = device_ids[0] if output_device is None else output_device
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        mask_labels: list[torch.Tensor] | None = None,
+        class_labels: list[torch.Tensor] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if not self.device_ids or pixel_values.size(0) == 0:
+            return self.module(pixel_values=pixel_values, mask_labels=mask_labels, class_labels=class_labels, **kwargs)
+
+        active_device_ids = self.device_ids[: min(len(self.device_ids), pixel_values.size(0))]
+        chunks = list(torch.chunk(pixel_values, len(active_device_ids), dim=0))
+        replicas = nn.parallel.replicate(self.module, active_device_ids)
+        kwargs_per_device: list[dict[str, Any]] = []
+        start = 0
+        for device_id, chunk in zip(active_device_ids, chunks):
+            end = start + chunk.size(0)
+            device = torch.device(f"cuda:{device_id}")
+            item = {"pixel_values": chunk.to(device, non_blocking=True)}
+            if mask_labels is not None:
+                item["mask_labels"] = [mask.to(device, non_blocking=True) for mask in mask_labels[start:end]]
+            if class_labels is not None:
+                item["class_labels"] = [labels.to(device, non_blocking=True) for labels in class_labels[start:end]]
+            item.update(kwargs)
+            kwargs_per_device.append(item)
+            start = end
+
+        outputs = nn.parallel.parallel_apply(replicas, [()] * len(replicas), kwargs_per_device, active_device_ids)
+        output_device = torch.device(f"cuda:{self.output_device}")
+        losses = [output.loss.to(output_device) * chunk.size(0) for output, chunk in zip(outputs, chunks)]
+        total = sum(chunk.size(0) for chunk in chunks)
+        return SimpleNamespace(loss=sum(losses) / total)
+
+
 @dataclass
 class ModelAPI:
     config: ModelConfig
@@ -227,8 +279,12 @@ class ModelAPI:
         self.module = self.module.to(self.device)
         device_ids = resolve_torch_device_ids(device_arg)
         if self.device.type == "cuda" and len(device_ids) > 1:
-            self.module = nn.DataParallel(self.module, device_ids=device_ids, output_device=device_ids[0])
-            print(f"Using DataParallel on CUDA devices: {device_ids}")
+            if self.config.architecture == "mask2former":
+                self.module = Mask2FormerDataParallel(self.module, device_ids=device_ids, output_device=device_ids[0])
+                print(f"Using Mask2FormerDataParallel on CUDA devices: {device_ids}")
+            else:
+                self.module = nn.DataParallel(self.module, device_ids=device_ids, output_device=device_ids[0])
+                print(f"Using DataParallel on CUDA devices: {device_ids}")
         return self
 
     def save(self, path: str | Path, image_size: int, metrics: dict[str, float] | None = None) -> None:
@@ -244,7 +300,7 @@ def save_checkpoint(
 ) -> None:
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+    model_to_save = model.module if isinstance(model, (nn.DataParallel, Mask2FormerDataParallel)) else model
     checkpoint = {
         "architecture": config.architecture,
         "model_name_or_path": config.model_name_or_path,
@@ -282,4 +338,3 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
     model = build_model(config)
     model.load_state_dict(checkpoint["state_dict"])
     return model, checkpoint
-
