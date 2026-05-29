@@ -3,13 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-DATASET_ROOT = Path("dataset")
 OUTPUT_ROOT = Path("runs") / "segmentation"
 PREPARED_ROOT = Path("outputs") / "prepared"
 
-IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+IMAGE_EXTENSIONS = {".tif", ".tiff"}
 RGB_RASTER_EXTENSIONS = {".tif", ".tiff"}
-LABEL_EXTENSIONS = {".json"}
 
 # Labels are GeoJSON polygons in Korea 2000 Central Belt coordinates.
 # The pipeline converts EPSG:5186 label coordinates into tile pixel space only.
@@ -17,6 +15,14 @@ LABEL_EXTENSIONS = {".json"}
 LABEL_CRS_EPSG = 5186
 ANALYSIS_CRS_EPSG = 5186
 OUTPUT_CRS = "pixel"
+GEOJSON_ID_FIELD = "id"
+GEOJSON_CLASS_FIELD = "class"
+GEOJSON_CLASS_ID_FIELD = "class_id"
+GEOJSON_AREA_PX_FIELD = "area_px"
+GEOJSON_AREA_M2_FIELD = "area_m2"
+GEOJSON_COORDINATE_CRS_FIELD = "coordinate_crs"
+GEOJSON_GSD_X_FIELD = "gsd_x_m"
+GEOJSON_GSD_Y_FIELD = "gsd_y_m"
 
 FEATURES_FIELD = "features"
 GEOMETRY_FIELD = "geometry"
@@ -25,7 +31,6 @@ PROPERTIES_FIELD = "properties"
 ANN_CODE_FIELD = "ANN_CD"
 
 BACKGROUND_ID = 0
-IGNORE_INDEX = 255
 DEFAULT_IMAGE_SIZE = 512
 DEFAULT_SEED = 42
 
@@ -62,16 +67,13 @@ CLASSES: tuple[SegmentationClass, ...] = (
 
 ANN_CODE_TO_TRAIN_ID = {ann_code: item.train_id for item in CLASSES for ann_code in item.ann_codes}
 ANN_CODE_TO_MODEL_ID = {ann_code: item.model_id for item in CLASSES for ann_code in item.ann_codes}
-TRAIN_ID_TO_MODEL_ID = {item.train_id: item.model_id for item in CLASSES}
 MODEL_ID_TO_TRAIN_ID = {item.model_id: item.train_id for item in CLASSES}
 
 TRAIN_ID_TO_NAME = {BACKGROUND_ID: "background"} | {item.train_id: item.name for item in CLASSES}
-NAME_TO_TRAIN_ID = {name: idx for idx, name in TRAIN_ID_TO_NAME.items()}
 TRAIN_ID_TO_COLOR = {BACKGROUND_ID: (0, 0, 0)} | {item.train_id: item.color for item in CLASSES}
 
 MODEL_ID_TO_NAME = {item.model_id: item.name for item in CLASSES}
 MODEL_NAME_TO_ID = {item.name: item.model_id for item in CLASSES}
-MODEL_ID_TO_COLOR = {item.model_id: item.color for item in CLASSES}
 
 NUM_SEMANTIC_CLASSES = len(TRAIN_ID_TO_NAME)
 NUM_SEGMENT_CLASSES = len(CLASSES)
