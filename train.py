@@ -68,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--limit", type=int, default=None, help="Optional sample limit for smoke tests.")
     parser.add_argument("--prepare-only", action="store_true", help="Export prepared masks/YOLO labels and exit.")
+    parser.add_argument("--force-prepare", action="store_true", help="Rebuild prepared YOLO/semantic datasets even if cached files exist.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     return parser.parse_args()
 
@@ -689,13 +690,21 @@ def link_or_copy(source: Path, target: Path) -> None:
 def prepare_yolo_dataset(args: argparse.Namespace) -> Path:
     train_samples, valid_samples = split_samples(args)
     yolo_root = ensure_dir(Path(args.prepared_dir) / "yolo")
+    data_yaml = yolo_root / "data.yaml"
+    cached_train_labels = list((yolo_root / "labels" / "train").glob("*.txt"))
+    cached_val_labels = list((yolo_root / "labels" / "val").glob("*.txt"))
+    if data_yaml.is_file() and cached_train_labels and cached_val_labels and not args.force_prepare:
+        print(f"Reusing prepared YOLO dataset: {data_yaml}")
+        print("Use --force-prepare to rebuild YOLO labels from GeoJSON.")
+        return data_yaml
+
+    print("Preparing YOLO dataset from GeoJSON labels. This step is CPU-bound and can take a long time on the full dataset.")
     for split_name, samples in (("train", train_samples), ("val", valid_samples)):
         for image_path, label_path in tqdm(samples, desc=f"prepare-yolo-{split_name}", leave=False):
             image_output = yolo_root / "images" / split_name / image_path.name
             label_output = yolo_root / "labels" / split_name / f"{image_path.stem}.txt"
             link_or_copy(image_path, image_output)
             write_yolo_label(label_path, label_output, image_size(image_path))
-    data_yaml = yolo_root / "data.yaml"
     lines = [
         f"path: {yolo_root.resolve().as_posix()}",
         "train: images/train",
@@ -753,6 +762,7 @@ def train_yolo(args: argparse.Namespace) -> None:
     }
     if yolo_device:
         train_kwargs["device"] = yolo_device
+    print(f"Starting Ultralytics YOLO training with device={train_kwargs.get('device', 'auto')}")
     results = model.train(**train_kwargs)
     save_dir = Path(getattr(results, "save_dir", arch_output_dir / "train"))
     weights_dir = save_dir / "weights"
