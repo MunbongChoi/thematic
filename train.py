@@ -60,8 +60,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers. For YOLO DDP this is per GPU process.")
-    parser.add_argument("--yolo-cache", default="ram", choices=["false", "ram", "disk"], help="Ultralytics image cache mode for YOLO.")
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers. For YOLO DDP this is per GPU process.")
+    parser.add_argument("--yolo-cache", default="false", choices=["false", "ram", "disk"], help="Ultralytics image cache mode for YOLO.")
+    parser.add_argument("--yolo-image-format", default="jpg", choices=["jpg", "png"], help="Prepared YOLO image format.")
+    parser.add_argument("--yolo-jpeg-quality", type=int, default=95, help="JPEG quality when --yolo-image-format jpg.")
     parser.add_argument("--yolo-amp", action=argparse.BooleanOptionalAction, default=True, help="Enable Ultralytics AMP for YOLO.")
     parser.add_argument("--device", default=None, help="Use cpu, 0, cuda:0, or 0,1 where supported.")
     parser.add_argument("--val-ratio", type=float, default=0.15)
@@ -584,23 +586,27 @@ def write_yolo_label(label_path: Path, output_path: Path, size: tuple[int, int])
     output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
-def write_yolo_rgb_image(source: Path, target: Path) -> None:
+def write_yolo_rgb_image(source: Path, target: Path, args: argparse.Namespace) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if not target.exists():
-        load_rgb_image(source).convert("RGB").save(target)
+        image = load_rgb_image(source).convert("RGB")
+        if target.suffix.lower() in {".jpg", ".jpeg"}:
+            image.save(target, quality=args.yolo_jpeg_quality, subsampling=0, optimize=True)
+        else:
+            image.save(target)
 
 
 def prepare_yolo_dataset(args: argparse.Namespace) -> Path:
     train_samples, valid_samples = split_samples(args)
-    yolo_root = ensure_dir(Path(args.prepared_dir) / "yolo_rgb")
+    yolo_root = ensure_dir(Path(args.prepared_dir) / f"yolo_rgb_{args.yolo_image_format}")
     data_yaml = yolo_root / "data.yaml"
     if data_yaml.is_file() and not args.force_prepare:
         return data_yaml
     for split_name, samples in (("train", train_samples), ("val", valid_samples)):
         for image_path, label_path in tqdm(samples, desc=f"prepare-yolo-{split_name}", leave=False):
-            image_output = yolo_root / "images" / split_name / f"{image_path.stem}.png"
+            image_output = yolo_root / "images" / split_name / f"{image_path.stem}.{args.yolo_image_format}"
             label_output = yolo_root / "labels" / split_name / f"{image_path.stem}.txt"
-            write_yolo_rgb_image(image_path, image_output)
+            write_yolo_rgb_image(image_path, image_output, args)
             write_yolo_label(label_path, label_output, image_size(image_path))
     lines = [f"path: {yolo_root.resolve().as_posix()}", "train: images/train", "val: images/val", "names:"]
     lines.extend(f"  {idx}: {name}" for idx, name in MODEL_ID_TO_NAME.items())

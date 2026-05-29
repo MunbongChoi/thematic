@@ -78,12 +78,12 @@ python train.py --architecture all --dataset-root dataset --output-dir runs/segm
 Train one model:
 
 ```powershell
-python train.py --architecture yolo --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 64 --device 0,1,2,3 --num-workers 8 --yolo-cache ram
+python train.py --architecture yolo --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 64 --device 0,1,2,3 --num-workers 4 --yolo-cache false --yolo-image-format jpg
 python train.py --architecture unet --dataset-root dataset --output-dir runs/segmentation --epochs 50
 python train.py --architecture mask2former --dataset-root dataset --output-dir runs/segmentation --epochs 50
 ```
 
-For RTX 4090 x4, YOLO should not be trained with `--batch-size 4`; that creates a very small per-GPU batch and usually leaves the GPUs underfed. Start with `--batch-size 64`, then reduce to `32` or `16` only if CUDA memory is exhausted. `--num-workers 8` is per YOLO GPU process, so this creates up to 32 loader workers in 4-GPU DDP.
+For RTX 4090 x4, YOLO should not be trained with `--batch-size 4`; that creates a very small per-GPU batch and usually leaves the GPUs underfed. Start with `--batch-size 64`, then reduce to `32` or `16` only if CUDA memory is exhausted. Avoid `--yolo-cache ram` on shared servers. Use `--yolo-cache false` first, or `--yolo-cache disk` if the prepared dataset is on fast local NVMe storage. `--num-workers` is per YOLO GPU process, so `--num-workers 4` creates up to 16 loader workers in 4-GPU DDP.
 
 Each model writes:
 
