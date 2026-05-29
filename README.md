@@ -72,8 +72,10 @@ python train.py --architecture mask2former --dataset-root dataset --output-dir r
 ```
 
 YOLO receives the multi-GPU device list directly. UNet and SegFormer use
-PyTorch `DataParallel`. Mask2Former uses a custom parallel wrapper so each
-image keeps the correct per-image `mask_labels` and `class_labels`.
+PyTorch `DataParallel`. Mask2Former falls back to the first requested GPU in
+this script because its per-image `mask_labels` and `class_labels` are not safe
+with the simple DataParallel path; use one GPU for Mask2Former unless a
+DistributedDataParallel training entrypoint is added.
 
 Each trained model writes:
 

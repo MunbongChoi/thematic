@@ -280,8 +280,11 @@ class ModelAPI:
         device_ids = resolve_torch_device_ids(device_arg)
         if self.device.type == "cuda" and len(device_ids) > 1:
             if self.config.architecture == "mask2former":
-                self.module = Mask2FormerDataParallel(self.module, device_ids=device_ids, output_device=device_ids[0])
-                print(f"Using Mask2FormerDataParallel on CUDA devices: {device_ids}")
+                print(
+                    "Mask2Former is using a single CUDA device because its per-image mask targets "
+                    "are not safe with this script's DataParallel path. "
+                    f"Requested devices were {device_ids}; using cuda:{device_ids[0]}."
+                )
             else:
                 self.module = nn.DataParallel(self.module, device_ids=device_ids, output_device=device_ids[0])
                 print(f"Using DataParallel on CUDA devices: {device_ids}")

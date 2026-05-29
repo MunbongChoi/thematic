@@ -40,7 +40,7 @@ from config import (
     TRAIN_ID_TO_NAME,
     YOLO_ID_TO_NAME,
 )
-from model import Mask2FormerDataParallel, ModelAPI, ModelConfig, build_yolo_model
+from model import ModelAPI, ModelConfig, build_yolo_model
 
 IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -124,8 +124,14 @@ def write_text_file(path: Path, content: str) -> None:
                     path.chmod(0o666)
                 except OSError:
                     pass
-                path.unlink()
-            os.replace(temp_path, path)
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            try:
+                os.replace(temp_path, path)
+            except PermissionError:
+                path.write_text(content, encoding="utf-8")
     except PermissionError as exc:
         raise PermissionError(
             f"Cannot write prepared output file: {path}\n"
@@ -598,12 +604,8 @@ def run_mask2former_epoch(
     with torch.set_grad_enabled(is_train):
         for batch in tqdm(loader, leave=False):
             images = batch["pixel_values"].to(device)
-            if isinstance(model, Mask2FormerDataParallel):
-                mask_labels = batch["mask_labels"]
-                class_labels = batch["class_labels"]
-            else:
-                mask_labels = [mask.to(device) for mask in batch["mask_labels"]]
-                class_labels = [labels.to(device) for labels in batch["class_labels"]]
+            mask_labels = [mask.to(device) for mask in batch["mask_labels"]]
+            class_labels = [labels.to(device) for labels in batch["class_labels"]]
             outputs = model(pixel_values=images, mask_labels=mask_labels, class_labels=class_labels)
             loss = outputs.loss
             if loss is None:
@@ -687,23 +689,36 @@ def link_or_copy(source: Path, target: Path) -> None:
         shutil.copy2(source, target)
 
 
+def write_yolo_rgb_image(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        return
+    image = load_rgb_image(source).convert("RGB")
+    image.save(target)
+
+
 def prepare_yolo_dataset(args: argparse.Namespace) -> Path:
     train_samples, valid_samples = split_samples(args)
-    yolo_root = ensure_dir(Path(args.prepared_dir) / "yolo")
+    yolo_root = ensure_dir(Path(args.prepared_dir) / "yolo_rgb")
     data_yaml = yolo_root / "data.yaml"
     cached_train_labels = list((yolo_root / "labels" / "train").glob("*.txt"))
     cached_val_labels = list((yolo_root / "labels" / "val").glob("*.txt"))
-    if data_yaml.is_file() and cached_train_labels and cached_val_labels and not args.force_prepare:
+    cached_train_images = list((yolo_root / "images" / "train").glob("*.png"))
+    cached_val_images = list((yolo_root / "images" / "val").glob("*.png"))
+    if data_yaml.is_file() and cached_train_labels and cached_val_labels and cached_train_images and cached_val_images and not args.force_prepare:
         print(f"Reusing prepared YOLO dataset: {data_yaml}")
         print("Use --force-prepare to rebuild YOLO labels from GeoJSON.")
         return data_yaml
 
-    print("Preparing YOLO dataset from GeoJSON labels. This step is CPU-bound and can take a long time on the full dataset.")
+    print(
+        "Preparing YOLO dataset from GeoJSON labels. This step is CPU-bound and can take a long time on the full dataset. "
+        "Images are converted to 3-channel RGB PNG to avoid mixed TIF channel counts during YOLO mosaic augmentation."
+    )
     for split_name, samples in (("train", train_samples), ("val", valid_samples)):
         for image_path, label_path in tqdm(samples, desc=f"prepare-yolo-{split_name}", leave=False):
-            image_output = yolo_root / "images" / split_name / image_path.name
+            image_output = yolo_root / "images" / split_name / f"{image_path.stem}.png"
             label_output = yolo_root / "labels" / split_name / f"{image_path.stem}.txt"
-            link_or_copy(image_path, image_output)
+            write_yolo_rgb_image(image_path, image_output)
             write_yolo_label(label_path, label_output, image_size(image_path))
     lines = [
         f"path: {yolo_root.resolve().as_posix()}",
