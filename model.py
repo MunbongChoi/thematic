@@ -11,7 +11,6 @@ from torch import nn
 
 from config import (
     DEFAULT_MASK2FORMER_MODEL,
-    DEFAULT_SAM_MODEL,
     DEFAULT_YOLO_MODEL,
     MODEL_ID_TO_NAME,
     MODEL_NAME_TO_ID,
@@ -20,7 +19,7 @@ from config import (
     TRAIN_ID_TO_NAME,
 )
 
-SUPPORTED_ARCHITECTURES = ("yolo", "unet", "mask2former", "sam")
+SUPPORTED_ARCHITECTURES = ("yolo", "unet", "mask2former")
 
 
 @dataclass(frozen=True)
@@ -39,9 +38,6 @@ class ModelConfig:
         elif architecture == "mask2former":
             model_name = self.model_name_or_path or DEFAULT_MASK2FORMER_MODEL
             num_labels = NUM_SEGMENT_CLASSES
-        elif architecture == "sam":
-            model_name = self.model_name_or_path or DEFAULT_SAM_MODEL
-            num_labels = 1
         else:
             model_name = self.model_name_or_path or "unet"
             num_labels = NUM_SEMANTIC_CLASSES
@@ -171,34 +167,6 @@ def build_mask2former_processor(model_name_or_path: str | None = None) -> Any:
     return Mask2FormerImageProcessor.from_pretrained(model_name_or_path or DEFAULT_MASK2FORMER_MODEL)
 
 
-def build_sam_processor(model_name_or_path: str | None = None) -> Any:
-    model_name = model_name_or_path or DEFAULT_SAM_MODEL
-    try:
-        if "sam2" in model_name.lower():
-            from transformers import Sam2Processor
-
-            return Sam2Processor.from_pretrained(model_name)
-        from transformers import SamProcessor
-
-        return SamProcessor.from_pretrained(model_name)
-    except ImportError as exc:
-        raise ImportError("A recent transformers build with SAM/SAM2 support is required.") from exc
-
-
-def build_sam_model(model_name_or_path: str | None = None) -> nn.Module:
-    model_name = model_name_or_path or DEFAULT_SAM_MODEL
-    try:
-        if "sam2" in model_name.lower():
-            from transformers import Sam2Model
-
-            return Sam2Model.from_pretrained(model_name)
-        from transformers import SamModel
-
-        return SamModel.from_pretrained(model_name)
-    except ImportError as exc:
-        raise ImportError("A recent transformers build with SAM/SAM2 support is required.") from exc
-
-
 def build_model(config: ModelConfig) -> nn.Module:
     cfg = config.normalized()
     if cfg.architecture == "unet":
@@ -215,8 +183,6 @@ def build_model(config: ModelConfig) -> nn.Module:
             label2id=MODEL_NAME_TO_ID,
             ignore_mismatched_sizes=True,
         )
-    if cfg.architecture == "sam":
-        return build_sam_model(cfg.model_name_or_path)
     raise ValueError("Use build_yolo_model() for architecture='yolo'.")
 
 

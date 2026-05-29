@@ -31,7 +31,7 @@ DEFAULT_SEED = 42
 
 DEFAULT_YOLO_MODEL = "yolo11n-seg.pt"
 DEFAULT_MASK2FORMER_MODEL = "facebook/mask2former-swin-tiny-coco-panoptic"
-DEFAULT_SAM_MODEL = "facebook/sam-vit-base"
+DEFAULT_SAMGEO_MODEL_TYPE = "vit_h"
 
 
 @dataclass(frozen=True)

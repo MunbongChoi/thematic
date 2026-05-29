@@ -37,11 +37,11 @@ from config import (
     RGB_RASTER_EXTENSIONS,
     TRAIN_ID_TO_NAME,
 )
-from model import ModelAPI, ModelConfig, build_sam_processor, build_yolo_model
+from model import ModelAPI, ModelConfig, build_yolo_model
 
 IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-SUPPORTED_TRAIN_ARCHITECTURES = ("all", "yolo", "unet", "mask2former", "sam")
+SUPPORTED_TRAIN_ARCHITECTURES = ("all", "yolo", "unet", "mask2former")
 
 
 class LabelSchemaError(ValueError):
@@ -66,7 +66,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="Optional sample limit for smoke tests.")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--force-prepare", action="store_true")
-    parser.add_argument("--train-sam-encoders", action="store_true", help="By default only SAM mask decoder parameters train.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     return parser.parse_args()
 
@@ -530,62 +529,6 @@ def run_mask2former_epoch(
     return {"loss": float(np.mean(losses)) if losses else 0.0}
 
 
-def dice_bce_loss(pred_masks: torch.Tensor, target_masks: torch.Tensor) -> torch.Tensor:
-    if pred_masks.ndim == 4 and pred_masks.shape[1] == 1:
-        pred_masks = pred_masks[:, 0]
-    target = F.interpolate(target_masks[:, None].float(), size=pred_masks.shape[-2:], mode="nearest")[:, 0]
-    bce = F.binary_cross_entropy_with_logits(pred_masks, target)
-    probs = pred_masks.sigmoid()
-    intersection = (probs * target).sum(dim=(1, 2))
-    union = probs.sum(dim=(1, 2)) + target.sum(dim=(1, 2))
-    dice = 1.0 - ((2.0 * intersection + 1.0) / (union + 1.0))
-    return bce + dice.mean()
-
-
-def sam_prompt_instances(batch: dict[str, object]) -> tuple[list[Image.Image], list[list[list[float]]], torch.Tensor]:
-    images: list[Image.Image] = []
-    input_boxes: list[list[list[float]]] = []
-    masks: list[torch.Tensor] = []
-    for pil_image, boxes, mask_labels in zip(batch["pil_images"], batch["boxes"], batch["mask_labels"]):
-        for box, mask in zip(boxes, mask_labels):
-            images.append(pil_image)
-            input_boxes.append([[float(value) for value in box.tolist()]])
-            masks.append(mask)
-    if not masks:
-        return [], [], torch.zeros((0, 1, 1), dtype=torch.float32)
-    return images, input_boxes, torch.stack(masks)
-
-
-def run_sam_epoch(
-    model: nn.Module,
-    processor: object,
-    loader: DataLoader,
-    device: torch.device,
-    optimizer: torch.optim.Optimizer | None = None,
-) -> dict[str, float]:
-    is_train = optimizer is not None
-    model.train(is_train)
-    losses: list[float] = []
-    with torch.set_grad_enabled(is_train):
-        for batch in tqdm(loader, leave=False):
-            images, input_boxes, target_masks = sam_prompt_instances(batch)
-            if not images:
-                continue
-            inputs = processor(images=images, input_boxes=input_boxes, return_tensors="pt")
-            inputs = {key: value.to(device) if torch.is_tensor(value) else value for key, value in inputs.items()}
-            outputs = model(**inputs, multimask_output=False)
-            pred_masks = outputs.pred_masks
-            while pred_masks.ndim > 3:
-                pred_masks = pred_masks[:, 0]
-            loss = dice_bce_loss(pred_masks, target_masks.to(device))
-            if is_train:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-            losses.append(float(loss.detach().cpu()))
-    return {"loss": float(np.mean(losses)) if losses else 0.0}
-
-
 def train_torch_model(
     args: argparse.Namespace,
     architecture: str,
@@ -612,32 +555,6 @@ def train_torch_model(
         improved = current > best_value if maximize else current < best_value
         if improved:
             best_value = current
-            model_api.save(arch_output_dir / "best.pt", args.image_size, valid_metrics)
-    (arch_output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-
-
-def train_sam(args: argparse.Namespace) -> None:
-    arch_output_dir = ensure_dir(Path(args.output_dir) / "sam")
-    train_loader, valid_loader = make_instance_loaders(args)
-    config = ModelConfig(architecture="sam", model_name_or_path=args.model_name_or_path).normalized()
-    model_api = ModelAPI.create(config).prepare_for_training(args.device)
-    if not args.train_sam_encoders:
-        for name, parameter in model_api.module.named_parameters():
-            if name.startswith(("vision_encoder", "prompt_encoder")):
-                parameter.requires_grad = False
-    optimizer = torch.optim.AdamW((p for p in model_api.module.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
-    processor = build_sam_processor(config.model_name_or_path)
-    best_value = float("inf")
-    history: list[dict[str, object]] = []
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = run_sam_epoch(model_api.module, processor, train_loader, model_api.device, optimizer)
-        valid_metrics = run_sam_epoch(model_api.module, processor, valid_loader, model_api.device, None)
-        row = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics}
-        history.append(row)
-        print(json.dumps(row, indent=2))
-        model_api.save(arch_output_dir / "last.pt", args.image_size, valid_metrics)
-        if valid_metrics["loss"] < best_value:
-            best_value = valid_metrics["loss"]
             model_api.save(arch_output_dir / "best.pt", args.image_size, valid_metrics)
     (arch_output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
 
@@ -775,7 +692,6 @@ TRAIN_DISPATCH = {
     "yolo": train_yolo,
     "unet": train_unet,
     "mask2former": train_mask2former,
-    "sam": train_sam,
 }
 
 
@@ -788,7 +704,7 @@ def main() -> None:
         return
     if args.architecture == "all" and args.model_name_or_path:
         raise ValueError("--model-name-or-path can target only one architecture. Run each architecture separately when overriding it.")
-    architectures = ("yolo", "unet", "mask2former", "sam") if args.architecture == "all" else (args.architecture,)
+    architectures = ("yolo", "unet", "mask2former") if args.architecture == "all" else (args.architecture,)
     for architecture in architectures:
         print(f"Training {architecture} -> {Path(args.output_dir) / architecture}")
         TRAIN_DISPATCH[architecture](args)

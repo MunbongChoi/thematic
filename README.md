@@ -2,12 +2,13 @@
 
 This project trains and runs panoptic segmentation models on the local RGB image and GeoJSON dataset.
 
-Supported models:
+Supported training models:
 
 - YOLO segmentation
 - U-Net semantic segmentation
 - Mask2Former panoptic segmentation
-- SAM/SAM2 mask refinement using Mask2Former bbox prompts
+
+SAM is inference-only and is run through `segment-geospatial` (`samgeo`) using Mask2Former bbox prompts.
 
 ## Dataset Contract
 
@@ -68,7 +69,7 @@ python train.py --prepare-only --dataset-root dataset --prepared-dir outputs/pre
 
 ## Train
 
-Train all supported models:
+Train all supported training models:
 
 ```powershell
 python train.py --architecture all --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 4
@@ -80,7 +81,6 @@ Train one model:
 python train.py --architecture yolo --dataset-root dataset --output-dir runs/segmentation --epochs 50
 python train.py --architecture unet --dataset-root dataset --output-dir runs/segmentation --epochs 50
 python train.py --architecture mask2former --dataset-root dataset --output-dir runs/segmentation --epochs 50
-python train.py --architecture sam --dataset-root dataset --output-dir runs/segmentation --epochs 50
 ```
 
 Each model writes:
@@ -95,10 +95,10 @@ Each model writes:
 python infer.py --architecture unet --checkpoint runs/segmentation/unet/best.pt --input dataset/test/image --output-dir outputs/infer/unet
 python infer.py --architecture yolo --checkpoint runs/segmentation/yolo/best.pt --input dataset/test/image --output-dir outputs/infer/yolo
 python infer.py --architecture mask2former --checkpoint runs/segmentation/mask2former/best.pt --input dataset/test/image --output-dir outputs/infer/mask2former
-python infer.py --architecture sam --checkpoint runs/segmentation/sam/best.pt --prompt-source-mask2former-checkpoint runs/segmentation/mask2former/best.pt --input dataset/test/image --output-dir outputs/infer/sam
+python infer.py --architecture sam --prompt-source-mask2former-checkpoint runs/segmentation/mask2former/best.pt --input dataset/test/image --output-dir outputs/infer/sam --samgeo-model-type vit_h
 ```
 
-SAM/SAM2 inference uses Mask2Former segments as bbox prompts and class sources.
+SAM inference uses `segment-geospatial` with Mask2Former segments as bbox prompts and class sources. SAM is not trained by `train.py`.
 
 Inference writes:
 
