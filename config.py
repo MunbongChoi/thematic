@@ -8,7 +8,7 @@ OUTPUT_ROOT = Path("runs") / "segmentation"
 PREPARED_ROOT = Path("outputs") / "prepared"
 
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
-RASTER_EXTENSIONS = {".tif", ".tiff"}
+RGB_RASTER_EXTENSIONS = {".tif", ".tiff"}
 LABEL_EXTENSIONS = {".json"}
 
 # Labels are GeoJSON polygons in Korea 2000 Central Belt coordinates.

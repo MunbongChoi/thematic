@@ -1,6 +1,6 @@
 # Panoptic Segmentation Pipeline
 
-This project trains and runs panoptic segmentation models on the local GeoJSON/TIF dataset.
+This project trains and runs panoptic segmentation models on the local RGB image and GeoJSON dataset.
 
 Supported models:
 
@@ -11,7 +11,7 @@ Supported models:
 
 ## Dataset Contract
 
-- Images: `dataset/{train,test}/image/**/*.tif`
+- Images: `dataset/{train,test}/image/**/*` with RGB imagery (`.tif`, `.tiff`, `.png`, `.jpg`, `.jpeg`)
 - Labels: `dataset/{train,test}/label/**/*.json`
 - Label format: GeoJSON `FeatureCollection`
 - Label CRS: `EPSG:5186`
@@ -19,6 +19,8 @@ Supported models:
 - Class field: `properties.ANN_CD`
 
 The code maps EPSG:5186 label coordinates into image pixel coordinates using each label tile's bounds. It does not calculate metric distance, area, buffer, nearest-neighbor distance, or density.
+
+Images are assumed to already contain the correct RGB visual bands. TIFF files are read as bands 1, 2, and 3 with rasterio; PNG/JPG files are read with PIL and converted to RGB. Geospatial CRS validation is performed on the GeoJSON labels, not the image pixels.
 
 ## Classes
 

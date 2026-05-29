@@ -224,7 +224,7 @@ def build_model(config: ModelConfig) -> nn.Module:
 class ModelAPI:
     config: ModelConfig
     module: nn.Module
-    device: torch.device = torch.device("cpu")
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @classmethod
     def create(cls, config: ModelConfig) -> "ModelAPI":

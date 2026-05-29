@@ -34,7 +34,7 @@ from config import (
     OUTPUT_ROOT,
     PREPARED_ROOT,
     PROPERTIES_FIELD,
-    RASTER_EXTENSIONS,
+    RGB_RASTER_EXTENSIONS,
     TRAIN_ID_TO_NAME,
 )
 from model import ModelAPI, ModelConfig, build_sam_processor, build_yolo_model
@@ -85,12 +85,8 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def array_to_uint8_rgb(array: np.ndarray) -> np.ndarray:
-    if array.ndim == 2:
-        array = np.stack([array, array, array], axis=-1)
-    if array.shape[-1] == 1:
-        array = np.repeat(array, 3, axis=-1)
-    if array.shape[-1] > 3:
-        array = array[:, :, :3]
+    if array.ndim != 3 or array.shape[-1] != 3:
+        raise ValueError(f"Expected RGB array with shape HxWx3, got {array.shape}.")
     if array.dtype == np.uint8:
         return array
     if np.issubdtype(array.dtype, np.integer):
@@ -98,28 +94,34 @@ def array_to_uint8_rgb(array: np.ndarray) -> np.ndarray:
         scaled = array.astype(np.float32) / max(1, info.max)
     else:
         scaled = array.astype(np.float32)
-        if float(np.nanmax(scaled)) > 1.0:
-            scaled /= max(float(np.nanmax(scaled)), 1.0)
+        max_value = float(np.nanmax(scaled)) if scaled.size else 1.0
+        if max_value > 1.0:
+            scaled /= max(max_value, 1.0)
     return np.clip(scaled * 255.0, 0, 255).astype(np.uint8)
 
 
 def load_rgb_image(image_path: Path) -> Image.Image:
-    if image_path.suffix.lower() in RASTER_EXTENSIONS:
+    # Source imagery is RGB. TIFF files are still read with rasterio because
+    # some tiled/compressed GeoTIFFs fail when PIL tries to load pixel data.
+    if image_path.suffix.lower() in RGB_RASTER_EXTENSIONS:
         try:
             import rasterio
             from rasterio.errors import NotGeoreferencedWarning
-        except ImportError:
-            return Image.open(image_path).convert("RGB")
+        except ImportError as exc:
+            raise ImportError("rasterio is required to read RGB TIFF inputs. Install requirements.txt.") from exc
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", NotGeoreferencedWarning)
             with rasterio.open(image_path) as src:
-                bands = src.read(list(range(1, min(src.count, 3) + 1)))
+                if src.count < 3:
+                    raise ValueError(f"{image_path} is expected to be RGB but has {src.count} band(s).")
+                bands = src.read([1, 2, 3])
         return Image.fromarray(array_to_uint8_rgb(np.moveaxis(bands, 0, -1)), mode="RGB")
-    return Image.open(image_path).convert("RGB")
+    with Image.open(image_path) as image:
+        return image.convert("RGB")
 
 
 def image_size(image_path: Path) -> tuple[int, int]:
-    if image_path.suffix.lower() in RASTER_EXTENSIONS:
+    if image_path.suffix.lower() in RGB_RASTER_EXTENSIONS:
         try:
             import rasterio
             from rasterio.errors import NotGeoreferencedWarning
