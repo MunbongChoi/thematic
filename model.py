@@ -4,26 +4,23 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
-import numpy as np  # noqa: F401
 import torch
 from torch import nn
 
 from config import (
     DEFAULT_MASK2FORMER_MODEL,
-    DEFAULT_SEGFORMER_MODEL,
+    DEFAULT_SAM_MODEL,
     DEFAULT_YOLO_MODEL,
-    MASK2FORMER_ID_TO_NAME,
-    MASK2FORMER_NAME_TO_ID,
+    MODEL_ID_TO_NAME,
+    MODEL_NAME_TO_ID,
     NUM_SEGMENT_CLASSES,
     NUM_SEMANTIC_CLASSES,
     TRAIN_ID_TO_NAME,
 )
 
-
-SUPPORTED_ARCHITECTURES = ("yolo", "unet", "segformer", "mask2former")
+SUPPORTED_ARCHITECTURES = ("yolo", "unet", "mask2former", "sam")
 
 
 @dataclass(frozen=True)
@@ -35,17 +32,16 @@ class ModelConfig:
     def normalized(self) -> "ModelConfig":
         architecture = self.architecture.strip().lower()
         if architecture not in SUPPORTED_ARCHITECTURES:
-            choices = ", ".join(SUPPORTED_ARCHITECTURES)
-            raise ValueError(f"Unsupported architecture {self.architecture!r}. Choose one of: {choices}")
+            raise ValueError(f"Unsupported architecture {self.architecture!r}. Choose one of: {SUPPORTED_ARCHITECTURES}")
         if architecture == "yolo":
             model_name = self.model_name_or_path or DEFAULT_YOLO_MODEL
             num_labels = NUM_SEGMENT_CLASSES
         elif architecture == "mask2former":
             model_name = self.model_name_or_path or DEFAULT_MASK2FORMER_MODEL
             num_labels = NUM_SEGMENT_CLASSES
-        elif architecture == "segformer":
-            model_name = self.model_name_or_path or DEFAULT_SEGFORMER_MODEL
-            num_labels = NUM_SEMANTIC_CLASSES
+        elif architecture == "sam":
+            model_name = self.model_name_or_path or DEFAULT_SAM_MODEL
+            num_labels = 1
         else:
             model_name = self.model_name_or_path or "unet"
             num_labels = NUM_SEMANTIC_CLASSES
@@ -74,7 +70,6 @@ def cuda_diagnostic_message(requested_device: str) -> str:
     else:
         output = result.stdout.strip() or result.stderr.strip()
         details.append(f"nvidia-smi={output if output else 'no output'}")
-    details.append("Install a CUDA-enabled PyTorch build in this same environment if GPU training is required.")
     return "\n".join(details)
 
 
@@ -88,18 +83,13 @@ def resolve_torch_device_ids(device: str | None = None) -> list[int]:
     device_ids: list[int] = []
     for raw_id in raw_ids:
         raw_id = raw_id.strip()
-        if not raw_id:
-            continue
-        try:
+        if raw_id:
             device_ids.append(int(raw_id))
-        except ValueError as exc:
-            raise ValueError(f"Invalid CUDA device list: {device!r}. Use '0' or '0,1,2,3'.") from exc
     if device_ids and not torch.cuda.is_available():
         raise RuntimeError(cuda_diagnostic_message(str(device)))
-    available = torch.cuda.device_count()
-    invalid = [idx for idx in device_ids if idx < 0 or idx >= available]
+    invalid = [idx for idx in device_ids if idx < 0 or idx >= torch.cuda.device_count()]
     if invalid:
-        raise RuntimeError(f"CUDA device index(es) {invalid} unavailable. Found {available} CUDA device(s).")
+        raise RuntimeError(f"CUDA device index(es) {invalid} unavailable. Found {torch.cuda.device_count()} CUDA device(s).")
     return device_ids
 
 
@@ -142,13 +132,13 @@ class UNet(nn.Module):
         self.enc4 = ConvBlock(base_channels * 4, base_channels * 8)
         self.pool = nn.MaxPool2d(2)
         self.bottleneck = ConvBlock(base_channels * 8, base_channels * 16)
-        self.up4 = nn.ConvTranspose2d(base_channels * 16, base_channels * 8, kernel_size=2, stride=2)
+        self.up4 = nn.ConvTranspose2d(base_channels * 16, base_channels * 8, 2, 2)
         self.dec4 = ConvBlock(base_channels * 16, base_channels * 8)
-        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, kernel_size=2, stride=2)
+        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, 2, 2)
         self.dec3 = ConvBlock(base_channels * 8, base_channels * 4)
-        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=2, stride=2)
+        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 2, 2)
         self.dec2 = ConvBlock(base_channels * 4, base_channels * 2)
-        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=2, stride=2)
+        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, 2, 2)
         self.dec1 = ConvBlock(base_channels * 2, base_channels)
         self.head = nn.Conv2d(base_channels, num_labels, kernel_size=1)
 
@@ -165,45 +155,6 @@ class UNet(nn.Module):
         return self.head(x)
 
 
-def build_model(config: ModelConfig) -> nn.Module:
-    cfg = config.normalized()
-    if cfg.architecture == "unet":
-        return UNet(num_labels=int(cfg.num_labels or NUM_SEMANTIC_CLASSES))
-    if cfg.architecture == "segformer":
-        try:
-            from transformers import AutoModelForSemanticSegmentation
-        except ImportError as exc:
-            raise ImportError("transformers is required for SegFormer. Install requirements.txt.") from exc
-        return AutoModelForSemanticSegmentation.from_pretrained(
-            str(cfg.model_name_or_path),
-            num_labels=int(cfg.num_labels or NUM_SEMANTIC_CLASSES),
-            id2label=TRAIN_ID_TO_NAME,
-            label2id={name: idx for idx, name in TRAIN_ID_TO_NAME.items()},
-            ignore_mismatched_sizes=True,
-        )
-    if cfg.architecture == "mask2former":
-        try:
-            from transformers import Mask2FormerForUniversalSegmentation
-        except ImportError as exc:
-            raise ImportError("transformers is required for Mask2Former. Install requirements.txt.") from exc
-        return Mask2FormerForUniversalSegmentation.from_pretrained(
-            str(cfg.model_name_or_path),
-            num_labels=int(cfg.num_labels or NUM_SEGMENT_CLASSES),
-            id2label=MASK2FORMER_ID_TO_NAME,
-            label2id=MASK2FORMER_NAME_TO_ID,
-            ignore_mismatched_sizes=True,
-        )
-    raise ValueError("Use build_yolo_model() for architecture='yolo'.")
-
-
-def build_mask2former_processor(model_name_or_path: str | None = None) -> Any:
-    try:
-        from transformers import Mask2FormerImageProcessor
-    except ImportError as exc:
-        raise ImportError("transformers is required for Mask2Former inference. Install requirements.txt.") from exc
-    return Mask2FormerImageProcessor.from_pretrained(model_name_or_path or DEFAULT_MASK2FORMER_MODEL)
-
-
 def build_yolo_model(model_name_or_path: str | Path | None = None) -> Any:
     try:
         from ultralytics import YOLO
@@ -212,55 +163,61 @@ def build_yolo_model(model_name_or_path: str | Path | None = None) -> Any:
     return YOLO(str(model_name_or_path or DEFAULT_YOLO_MODEL))
 
 
-class Mask2FormerDataParallel(nn.Module):
-    """DataParallel wrapper that keeps per-image mask targets aligned.
+def build_mask2former_processor(model_name_or_path: str | None = None) -> Any:
+    try:
+        from transformers import Mask2FormerImageProcessor
+    except ImportError as exc:
+        raise ImportError("transformers is required for Mask2Former. Install requirements.txt.") from exc
+    return Mask2FormerImageProcessor.from_pretrained(model_name_or_path or DEFAULT_MASK2FORMER_MODEL)
 
-    Hugging Face Mask2Former receives `mask_labels` and `class_labels` as lists
-    with one item per image. PyTorch's generic DataParallel recursively scatters
-    list items, which can split an instance-mask tensor along the wrong axis.
-    This wrapper slices those lists by image batch before dispatching replicas.
-    """
 
-    def __init__(self, module: nn.Module, device_ids: list[int], output_device: int | None = None) -> None:
-        super().__init__()
-        if len(device_ids) < 2:
-            raise ValueError("Mask2FormerDataParallel requires at least two CUDA devices.")
-        self.module = module
-        self.device_ids = device_ids
-        self.output_device = device_ids[0] if output_device is None else output_device
+def build_sam_processor(model_name_or_path: str | None = None) -> Any:
+    model_name = model_name_or_path or DEFAULT_SAM_MODEL
+    try:
+        if "sam2" in model_name.lower():
+            from transformers import Sam2Processor
 
-    def forward(
-        self,
-        pixel_values: torch.Tensor,
-        mask_labels: list[torch.Tensor] | None = None,
-        class_labels: list[torch.Tensor] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        if not self.device_ids or pixel_values.size(0) == 0:
-            return self.module(pixel_values=pixel_values, mask_labels=mask_labels, class_labels=class_labels, **kwargs)
+            return Sam2Processor.from_pretrained(model_name)
+        from transformers import SamProcessor
 
-        active_device_ids = self.device_ids[: min(len(self.device_ids), pixel_values.size(0))]
-        chunks = list(torch.chunk(pixel_values, len(active_device_ids), dim=0))
-        replicas = nn.parallel.replicate(self.module, active_device_ids)
-        kwargs_per_device: list[dict[str, Any]] = []
-        start = 0
-        for device_id, chunk in zip(active_device_ids, chunks):
-            end = start + chunk.size(0)
-            device = torch.device(f"cuda:{device_id}")
-            item = {"pixel_values": chunk.to(device, non_blocking=True)}
-            if mask_labels is not None:
-                item["mask_labels"] = [mask.to(device, non_blocking=True) for mask in mask_labels[start:end]]
-            if class_labels is not None:
-                item["class_labels"] = [labels.to(device, non_blocking=True) for labels in class_labels[start:end]]
-            item.update(kwargs)
-            kwargs_per_device.append(item)
-            start = end
+        return SamProcessor.from_pretrained(model_name)
+    except ImportError as exc:
+        raise ImportError("A recent transformers build with SAM/SAM2 support is required.") from exc
 
-        outputs = nn.parallel.parallel_apply(replicas, [()] * len(replicas), kwargs_per_device, active_device_ids)
-        output_device = torch.device(f"cuda:{self.output_device}")
-        losses = [output.loss.to(output_device) * chunk.size(0) for output, chunk in zip(outputs, chunks)]
-        total = sum(chunk.size(0) for chunk in chunks)
-        return SimpleNamespace(loss=sum(losses) / total)
+
+def build_sam_model(model_name_or_path: str | None = None) -> nn.Module:
+    model_name = model_name_or_path or DEFAULT_SAM_MODEL
+    try:
+        if "sam2" in model_name.lower():
+            from transformers import Sam2Model
+
+            return Sam2Model.from_pretrained(model_name)
+        from transformers import SamModel
+
+        return SamModel.from_pretrained(model_name)
+    except ImportError as exc:
+        raise ImportError("A recent transformers build with SAM/SAM2 support is required.") from exc
+
+
+def build_model(config: ModelConfig) -> nn.Module:
+    cfg = config.normalized()
+    if cfg.architecture == "unet":
+        return UNet(num_labels=int(cfg.num_labels or NUM_SEMANTIC_CLASSES))
+    if cfg.architecture == "mask2former":
+        try:
+            from transformers import Mask2FormerForUniversalSegmentation
+        except ImportError as exc:
+            raise ImportError("transformers is required for Mask2Former. Install requirements.txt.") from exc
+        return Mask2FormerForUniversalSegmentation.from_pretrained(
+            str(cfg.model_name_or_path),
+            num_labels=int(cfg.num_labels or NUM_SEGMENT_CLASSES),
+            id2label=MODEL_ID_TO_NAME,
+            label2id=MODEL_NAME_TO_ID,
+            ignore_mismatched_sizes=True,
+        )
+    if cfg.architecture == "sam":
+        return build_sam_model(cfg.model_name_or_path)
+    raise ValueError("Use build_yolo_model() for architecture='yolo'.")
 
 
 @dataclass
@@ -278,16 +235,8 @@ class ModelAPI:
         self.device = resolve_torch_device(device_arg)
         self.module = self.module.to(self.device)
         device_ids = resolve_torch_device_ids(device_arg)
-        if self.device.type == "cuda" and len(device_ids) > 1:
-            if self.config.architecture == "mask2former":
-                print(
-                    "Mask2Former is using a single CUDA device because its per-image mask targets "
-                    "are not safe with this script's DataParallel path. "
-                    f"Requested devices were {device_ids}; using cuda:{device_ids[0]}."
-                )
-            else:
-                self.module = nn.DataParallel(self.module, device_ids=device_ids, output_device=device_ids[0])
-                print(f"Using DataParallel on CUDA devices: {device_ids}")
+        if self.device.type == "cuda" and len(device_ids) > 1 and self.config.architecture == "unet":
+            self.module = nn.DataParallel(self.module, device_ids=device_ids, output_device=device_ids[0])
         return self
 
     def save(self, path: str | Path, image_size: int, metrics: dict[str, float] | None = None) -> None:
@@ -303,18 +252,20 @@ def save_checkpoint(
 ) -> None:
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    model_to_save = model.module if isinstance(model, (nn.DataParallel, Mask2FormerDataParallel)) else model
-    checkpoint = {
-        "architecture": config.architecture,
-        "model_name_or_path": config.model_name_or_path,
-        "num_labels": config.num_labels,
-        "image_size": image_size,
-        "state_dict": model_to_save.state_dict(),
-        "semantic_id2label": TRAIN_ID_TO_NAME,
-        "mask2former_id2label": MASK2FORMER_ID_TO_NAME,
-        "metrics": metrics or {},
-    }
-    torch.save(checkpoint, checkpoint_path)
+    model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+    torch.save(
+        {
+            "architecture": config.architecture,
+            "model_name_or_path": config.model_name_or_path,
+            "num_labels": config.num_labels,
+            "image_size": image_size,
+            "state_dict": model_to_save.state_dict(),
+            "semantic_id2label": TRAIN_ID_TO_NAME,
+            "segment_id2label": MODEL_ID_TO_NAME,
+            "metrics": metrics or {},
+        },
+        checkpoint_path,
+    )
 
 
 def resolve_checkpoint_path(path: str | Path) -> Path:
@@ -339,5 +290,5 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
         num_labels=int(checkpoint.get("num_labels") or NUM_SEMANTIC_CLASSES),
     ).normalized()
     model = build_model(config)
-    model.load_state_dict(checkpoint["state_dict"])
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
     return model, checkpoint

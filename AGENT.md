@@ -13,21 +13,25 @@
 - dataset/
     - train/
         - image/
-            - .TIF
+            - *.TIF
         - label/
-            - .JSON
+            - *.JSON
     - valid/
         - image/
-            - .TIF
+            - *.TIF
         - label/
-            - .JSON
+            - *.JSON
 - infer_data/
 - AGENT.md
 - train.py
 - test.py
-- model.py
 - infer.py
 
 ## 4. 요청사항
 train과 test를 진행할 때, model변경이 가능하도록
 모델 각각 파일 생성
+멀티GPU 사용
+데이터 처리부분 따로 구분할 것
+모델 전부 학습 가능하게 만들 것
+모델 추론부분 만들 것
+yolo26, mask2former, Unet, SAM 사용가능하게 할 것

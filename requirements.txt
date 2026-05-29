@@ -1,7 +1,9 @@
 numpy
 Pillow
 tqdm
+torch
 transformers
 ultralytics
 rasterio
 shapely
+affine

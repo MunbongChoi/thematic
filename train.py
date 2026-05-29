@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import shutil
-import tempfile
 import warnings
 from pathlib import Path
 from typing import Callable, Iterable
@@ -15,13 +13,14 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from config import (
+    ANALYSIS_CRS_EPSG,
     ANN_CODE_FIELD,
+    ANN_CODE_TO_MODEL_ID,
     ANN_CODE_TO_TRAIN_ID,
-    ANN_CODE_TO_YOLO_ID,
     BACKGROUND_ID,
     CLASSES,
     DEFAULT_IMAGE_SIZE,
@@ -31,20 +30,18 @@ from config import (
     GEOMETRY_TYPES,
     IMAGE_EXTENSIONS,
     LABEL_CRS_EPSG,
-    MASK2FORMER_ID_TO_NAME,
-    NUM_SEMANTIC_CLASSES,
+    MODEL_ID_TO_NAME,
     OUTPUT_ROOT,
     PREPARED_ROOT,
     PROPERTIES_FIELD,
     RASTER_EXTENSIONS,
     TRAIN_ID_TO_NAME,
-    YOLO_ID_TO_NAME,
 )
-from model import ModelAPI, ModelConfig, build_yolo_model
+from model import ModelAPI, ModelConfig, build_sam_processor, build_yolo_model
 
 IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-SUPPORTED_TRAIN_ARCHITECTURES = ("all", "yolo", "unet", "segformer", "mask2former")
+SUPPORTED_TRAIN_ARCHITECTURES = ("all", "yolo", "unet", "mask2former", "sam")
 
 
 class LabelSchemaError(ValueError):
@@ -52,23 +49,24 @@ class LabelSchemaError(ValueError):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build datasets and train segmentation models.")
+    parser = argparse.ArgumentParser(description="Build panoptic segmentation datasets and train models.")
     parser.add_argument("--dataset-root", default="dataset")
     parser.add_argument("--output-dir", default=str(OUTPUT_ROOT))
     parser.add_argument("--prepared-dir", default=str(PREPARED_ROOT))
     parser.add_argument("--architecture", default="all", choices=SUPPORTED_TRAIN_ARCHITECTURES)
-    parser.add_argument("--model-name-or-path", default=None, help="Optional pretrained model id/path for the selected architecture.")
+    parser.add_argument("--model-name-or-path", default=None)
     parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--device", default=None, help="Use 'cpu', '0', 'cuda:0', or '0,1' for DataParallel where supported.")
+    parser.add_argument("--device", default=None, help="Use cpu, 0, cuda:0, or 0,1 where supported.")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--limit", type=int, default=None, help="Optional sample limit for smoke tests.")
-    parser.add_argument("--prepare-only", action="store_true", help="Export prepared masks/YOLO labels and exit.")
-    parser.add_argument("--force-prepare", action="store_true", help="Rebuild prepared YOLO/semantic datasets even if cached files exist.")
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--force-prepare", action="store_true")
+    parser.add_argument("--train-sam-encoders", action="store_true", help="By default only SAM mask decoder parameters train.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     return parser.parse_args()
 
@@ -86,68 +84,6 @@ def ensure_dir(path: str | Path) -> Path:
     return output_dir
 
 
-def normalize_yolo_device(device: str | None) -> str | None:
-    if device is None:
-        return None
-    normalized = str(device).strip().lower()
-    if normalized in {"", "none"}:
-        return None
-    if normalized == "cpu":
-        return "cpu"
-    return normalized.replace("cuda:", "")
-
-
-def write_text_file(path: Path, content: str) -> None:
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        try:
-            path.chmod(0o666)
-        except OSError:
-            pass
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as file:
-            file.write(content)
-            temp_path = Path(file.name)
-        try:
-            os.replace(temp_path, path)
-        except PermissionError:
-            if path.exists():
-                try:
-                    path.chmod(0o666)
-                except OSError:
-                    pass
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-            try:
-                os.replace(temp_path, path)
-            except PermissionError:
-                path.write_text(content, encoding="utf-8")
-    except PermissionError as exc:
-        raise PermissionError(
-            f"Cannot write prepared output file: {path}\n"
-            "Check directory/file ownership and write permission, or use a writable prepared directory:\n"
-            "  python train.py ... --prepared-dir <writable_path>\n"
-            "On Linux servers, this often means the previous outputs were created by another user/root; "
-            "fix ownership with chown/chmod or choose a new --prepared-dir."
-        ) from exc
-    finally:
-        try:
-            if "temp_path" in locals() and temp_path.exists():
-                temp_path.unlink()
-        except OSError:
-            pass
-
-
 def array_to_uint8_rgb(array: np.ndarray) -> np.ndarray:
     if array.ndim == 2:
         array = np.stack([array, array, array], axis=-1)
@@ -160,11 +96,11 @@ def array_to_uint8_rgb(array: np.ndarray) -> np.ndarray:
     if np.issubdtype(array.dtype, np.integer):
         info = np.iinfo(array.dtype)
         scaled = array.astype(np.float32) / max(1, info.max)
-        return np.clip(scaled * 255.0, 0, 255).astype(np.uint8)
-    scaled = array.astype(np.float32)
-    if float(np.nanmax(scaled)) <= 1.0:
-        scaled *= 255.0
-    return np.clip(scaled, 0, 255).astype(np.uint8)
+    else:
+        scaled = array.astype(np.float32)
+        if float(np.nanmax(scaled)) > 1.0:
+            scaled /= max(float(np.nanmax(scaled)), 1.0)
+    return np.clip(scaled * 255.0, 0, 255).astype(np.uint8)
 
 
 def load_rgb_image(image_path: Path) -> Image.Image:
@@ -228,7 +164,7 @@ def label_bounds(data: dict, label_path: Path) -> tuple[float, float, float, flo
     for feature in data.get(FEATURES_FIELD, []):
         geometry = feature.get(GEOMETRY_FIELD, {})
         if geometry.get("type") not in GEOMETRY_TYPES:
-            continue
+            raise LabelSchemaError(f"{label_path} has unsupported geometry type {geometry.get('type')!r}.")
         for ring in iter_raw_rings(geometry):
             for point in ring:
                 if len(point) >= 2:
@@ -244,6 +180,7 @@ def geo_to_pixel_transform(data: dict, label_path: Path, size: tuple[int, int]) 
     width, height = size
     if width <= 0 or height <= 0 or max_x <= min_x or max_y <= min_y:
         raise LabelSchemaError(f"{label_path} has invalid image size or label bounds.")
+    # EPSG:5186 tile coordinates are mapped into pixel space for mask creation.
     return min_x, max_y, (max_x - min_x) / width, (max_y - min_y) / height
 
 
@@ -288,13 +225,7 @@ def polygons_from_geometry(
     geometry = repaired_geometry(geometry)
     geometry_type = geometry.get("type")
     coordinates = geometry.get("coordinates", [])
-    if geometry_type == "Polygon":
-        polygons = [coordinates]
-    elif geometry_type == "MultiPolygon":
-        polygons = coordinates
-    else:
-        return []
-
+    polygons = [coordinates] if geometry_type == "Polygon" else coordinates if geometry_type == "MultiPolygon" else []
     pixel_polygons: list[list[list[tuple[float, float]]]] = []
     for polygon in polygons:
         rings: list[list[tuple[float, float]]] = []
@@ -308,8 +239,7 @@ def polygons_from_geometry(
 
 
 def feature_ann_code(feature: dict, label_path: Path, feature_idx: int) -> int:
-    properties = feature.get(PROPERTIES_FIELD, {})
-    raw_ann_code = properties.get(ANN_CODE_FIELD)
+    raw_ann_code = feature.get(PROPERTIES_FIELD, {}).get(ANN_CODE_FIELD)
     if raw_ann_code is None:
         raise LabelSchemaError(f"{label_path} feature {feature_idx} is missing {ANN_CODE_FIELD}.")
     try:
@@ -342,53 +272,49 @@ def render_semantic_mask(label_path: Path, size: tuple[int, int]) -> np.ndarray:
         if not polygons:
             continue
         feature_mask = rasterize_feature_mask(polygons, size)
-        semantic[feature_mask] = ANN_CODE_TO_TRAIN_ID[ann_code]
+        if feature_mask.any():
+            semantic[feature_mask] = ANN_CODE_TO_TRAIN_ID[ann_code]
     return semantic
 
 
-def render_mask2former_targets(label_path: Path, size: tuple[int, int], output_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def render_instance_targets(label_path: Path, size: tuple[int, int], output_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     data = load_label(label_path)
     transform = geo_to_pixel_transform(data, label_path, size)
     masks: list[torch.Tensor] = []
     class_labels: list[int] = []
+    boxes: list[list[float]] = []
     for feature_idx, feature in enumerate(data.get(FEATURES_FIELD, []), start=1):
         ann_code = feature_ann_code(feature, label_path, feature_idx)
         polygons = polygons_from_geometry(feature.get(GEOMETRY_FIELD, {}), transform, size)
         if not polygons:
             continue
         mask = rasterize_feature_mask(polygons, size).astype(np.uint8)
-        mask_image = Image.fromarray(mask, mode="L").resize((output_size, output_size), Image.NEAREST)
-        mask_tensor = torch.from_numpy(np.asarray(mask_image, dtype=np.float32))
-        if mask_tensor.numel() == 0:
+        if not mask.any():
             continue
-        masks.append(mask_tensor)
-        class_labels.append(ANN_CODE_TO_YOLO_ID[ann_code])
+        ys, xs = np.nonzero(mask)
+        boxes.append([float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())])
+        mask_image = Image.fromarray(mask, mode="L").resize((output_size, output_size), Image.NEAREST)
+        masks.append(torch.from_numpy(np.asarray(mask_image, dtype=np.float32)))
+        class_labels.append(ANN_CODE_TO_MODEL_ID[ann_code])
     if not masks:
-        return torch.zeros((0, output_size, output_size), dtype=torch.float32), torch.zeros((0,), dtype=torch.long)
-    return torch.stack(masks), torch.tensor(class_labels, dtype=torch.long)
+        return (
+            torch.zeros((0, output_size, output_size), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.long),
+            torch.zeros((0, 4), dtype=torch.float32),
+        )
+    return torch.stack(masks), torch.tensor(class_labels, dtype=torch.long), torch.tensor(boxes, dtype=torch.float32)
 
 
-def build_image_index(image_dir: Path) -> tuple[dict[str, Path], dict[str, Path]]:
-    by_name: dict[str, Path] = {}
+def build_image_index(image_dir: Path) -> dict[str, Path]:
     by_stem: dict[str, Path] = {}
     for image_path in sorted(path for path in image_dir.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS):
-        by_name.setdefault(image_path.name, image_path)
         by_stem.setdefault(image_path.stem, image_path)
-    return by_name, by_stem
+    return by_stem
 
 
-def find_image_for_label(image_dir: Path, label_path: Path, image_index: tuple[dict[str, Path], dict[str, Path]]) -> Path:
-    by_name, by_stem = image_index
-    try:
-        data = load_label(label_path)
-    except LabelSchemaError:
-        data = {}
-    for feature in data.get(FEATURES_FIELD, []):
-        image_id = feature.get(PROPERTIES_FIELD, {}).get("image_id")
-        if image_id and Path(str(image_id)).name in by_name:
-            return by_name[Path(str(image_id)).name]
-    if label_path.stem in by_stem:
-        return by_stem[label_path.stem]
+def find_image_for_label(label_path: Path, image_index: dict[str, Path]) -> Path:
+    if label_path.stem in image_index:
+        return image_index[label_path.stem]
     raise FileNotFoundError(f"No image matched label: {label_path}")
 
 
@@ -398,12 +324,12 @@ def collect_samples(split_dir: Path, limit: int | None = None) -> list[tuple[Pat
     if not image_dir.exists() or not label_dir.exists():
         raise FileNotFoundError(f"Expected image/ and label/ under {split_dir}")
     image_index = build_image_index(image_dir)
-    label_paths = sorted(label_dir.rglob("*.json"))
+    label_paths = sorted(path for path in label_dir.rglob("*") if path.suffix.lower() == ".json")
     if limit:
         label_paths = label_paths[:limit]
     if not label_paths:
         raise FileNotFoundError(f"No JSON labels found under {label_dir}")
-    return [(find_image_for_label(image_dir, label_path, image_index), label_path) for label_path in label_paths]
+    return [(find_image_for_label(label_path, image_index), label_path) for label_path in label_paths]
 
 
 def has_labeled_split(split_dir: Path) -> bool:
@@ -411,20 +337,17 @@ def has_labeled_split(split_dir: Path) -> bool:
 
 
 def split_samples(args: argparse.Namespace) -> tuple[list[tuple[Path, Path]], list[tuple[Path, Path]]]:
-    if not 0.0 < args.val_ratio < 1.0:
-        raise ValueError("--val-ratio must be between 0 and 1.")
     dataset_root = Path(args.dataset_root)
     train_samples = collect_samples(dataset_root / "train", args.limit)
-    valid_dir = dataset_root / "valid"
-    if has_labeled_split(valid_dir):
-        return train_samples, collect_samples(valid_dir, args.limit)
-    if len(train_samples) < 2:
-        raise ValueError("At least two training samples are required when dataset/valid is unavailable.")
-    rng = random.Random(args.seed)
+    if has_labeled_split(dataset_root / "valid"):
+        return train_samples, collect_samples(dataset_root / "valid", args.limit)
+    if has_labeled_split(dataset_root / "test"):
+        return train_samples, collect_samples(dataset_root / "test", args.limit)
+    if not 0.0 < args.val_ratio < 1.0:
+        raise ValueError("--val-ratio must be between 0 and 1.")
     shuffled = train_samples[:]
-    rng.shuffle(shuffled)
-    val_size = max(1, int(len(shuffled) * args.val_ratio))
-    val_size = min(val_size, len(shuffled) - 1)
+    random.Random(args.seed).shuffle(shuffled)
+    val_size = max(1, min(len(shuffled) - 1, int(len(shuffled) * args.val_ratio)))
     return shuffled[val_size:], shuffled[:val_size]
 
 
@@ -443,16 +366,15 @@ class SemanticSegmentationDataset(Dataset):
         image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
         mask = Image.fromarray(semantic, mode="L").resize((self.image_size, self.image_size), Image.NEAREST)
         image_tensor = torch.from_numpy(np.array(image, copy=True)).permute(2, 0, 1).float() / 255.0
-        image_tensor = (image_tensor - IMAGE_MEAN) / IMAGE_STD
         return {
-            "pixel_values": image_tensor,
+            "pixel_values": (image_tensor - IMAGE_MEAN) / IMAGE_STD,
             "labels": torch.from_numpy(np.asarray(mask, dtype=np.int64)),
             "image_path": str(image_path),
             "label_path": str(label_path),
         }
 
 
-class Mask2FormerDataset(Dataset):
+class InstanceSegmentationDataset(Dataset):
     def __init__(self, samples: list[tuple[Path, Path]], image_size_value: int) -> None:
         self.samples = samples
         self.image_size = image_size_value
@@ -463,20 +385,26 @@ class Mask2FormerDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, object]:
         image_path, label_path = self.samples[index]
         image = load_rgb_image(image_path)
-        mask_labels, class_labels = render_mask2former_targets(label_path, image.size, self.image_size)
-        image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
-        image_tensor = torch.from_numpy(np.array(image, copy=True)).permute(2, 0, 1).float() / 255.0
-        image_tensor = (image_tensor - IMAGE_MEAN) / IMAGE_STD
+        mask_labels, class_labels, boxes = render_instance_targets(label_path, image.size, self.image_size)
+        resized = image.resize((self.image_size, self.image_size), Image.BILINEAR)
+        image_tensor = torch.from_numpy(np.array(resized, copy=True)).permute(2, 0, 1).float() / 255.0
+        scale_x = self.image_size / max(1, image.width)
+        scale_y = self.image_size / max(1, image.height)
+        if boxes.numel():
+            boxes[:, [0, 2]] *= scale_x
+            boxes[:, [1, 3]] *= scale_y
         return {
-            "pixel_values": image_tensor,
+            "pixel_values": (image_tensor - IMAGE_MEAN) / IMAGE_STD,
             "mask_labels": mask_labels,
             "class_labels": class_labels,
+            "boxes": boxes,
+            "pil_image": resized,
             "image_path": str(image_path),
             "label_path": str(label_path),
         }
 
 
-def collate_semantic(batch: list[dict[str, torch.Tensor | str]]) -> dict[str, torch.Tensor | list[str]]:
+def collate_semantic(batch: list[dict[str, torch.Tensor | str]]) -> dict[str, object]:
     return {
         "pixel_values": torch.stack([item["pixel_values"] for item in batch if isinstance(item["pixel_values"], torch.Tensor)]),
         "labels": torch.stack([item["labels"] for item in batch if isinstance(item["labels"], torch.Tensor)]),
@@ -485,11 +413,13 @@ def collate_semantic(batch: list[dict[str, torch.Tensor | str]]) -> dict[str, to
     }
 
 
-def collate_mask2former(batch: list[dict[str, object]]) -> dict[str, object]:
+def collate_instance(batch: list[dict[str, object]]) -> dict[str, object]:
     return {
         "pixel_values": torch.stack([item["pixel_values"] for item in batch if isinstance(item["pixel_values"], torch.Tensor)]),
         "mask_labels": [item["mask_labels"] for item in batch],
         "class_labels": [item["class_labels"] for item in batch],
+        "boxes": [item["boxes"] for item in batch],
+        "pil_images": [item["pil_image"] for item in batch],
         "image_path": [str(item["image_path"]) for item in batch],
         "label_path": [str(item["label_path"]) for item in batch],
     }
@@ -514,59 +444,40 @@ def make_semantic_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoa
     )
 
 
-def make_mask2former_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
+def make_instance_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     train_samples, valid_samples = split_samples(args)
     return (
-        make_loader(Mask2FormerDataset(train_samples, args.image_size), args, True, collate_mask2former),
-        make_loader(Mask2FormerDataset(valid_samples, args.image_size), args, False, collate_mask2former),
+        make_loader(InstanceSegmentationDataset(train_samples, args.image_size), args, True, collate_instance),
+        make_loader(InstanceSegmentationDataset(valid_samples, args.image_size), args, False, collate_instance),
     )
-
-
-def logits_from_model(model: nn.Module, architecture: str, images: torch.Tensor, labels: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if architecture == "segformer":
-        outputs = model(pixel_values=images, labels=labels)
-        logits = outputs.logits
-        loss = outputs.loss if labels is not None else None
-    else:
-        logits = model(images)
-        loss = F.cross_entropy(logits, labels) if labels is not None else None
-    if logits.shape[-2:] != images.shape[-2:]:
-        logits = F.interpolate(logits, size=images.shape[-2:], mode="bilinear", align_corners=False)
-    return logits, loss
 
 
 def compute_semantic_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, float]:
     preds = logits.argmax(dim=1)
-    metric: dict[str, float] = {}
     ious: list[float] = []
-    for class_id, class_name in TRAIN_ID_TO_NAME.items():
+    for class_id in TRAIN_ID_TO_NAME:
+        if class_id == BACKGROUND_ID:
+            continue
         pred = preds == class_id
         target = labels == class_id
         union = (pred | target).sum().item()
-        if union == 0:
-            continue
-        intersection = (pred & target).sum().item()
-        iou = intersection / union
-        metric[f"iou_{class_name}"] = iou
-        if class_id != BACKGROUND_ID:
-            ious.append(iou)
-    metric["mean_iou"] = float(np.mean(ious)) if ious else 0.0
-    metric["pixel_accuracy"] = float((preds == labels).sum().item() / max(1, labels.numel()))
-    return metric
+        if union:
+            ious.append(float((pred & target).sum().item() / union))
+    return {
+        "mean_iou": float(np.mean(ious)) if ious else 0.0,
+        "pixel_accuracy": float((preds == labels).sum().item() / max(1, labels.numel())),
+    }
 
 
 def average_metrics(items: Iterable[dict[str, float]]) -> dict[str, float]:
     rows = list(items)
-    if not rows:
-        raise RuntimeError("No metrics were produced.")
     keys = sorted({key for row in rows for key in row})
     return {key: float(np.mean([row[key] for row in rows if key in row])) for key in keys}
 
 
-def run_semantic_epoch(
+def run_unet_epoch(
     model: nn.Module,
     loader: DataLoader,
-    architecture: str,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> dict[str, float]:
@@ -578,9 +489,10 @@ def run_semantic_epoch(
         for batch in tqdm(loader, leave=False):
             images = batch["pixel_values"].to(device)
             labels = batch["labels"].to(device)
-            logits, loss = logits_from_model(model, architecture, images, labels)
-            if loss is None:
-                raise RuntimeError("Model did not return a loss.")
+            logits = model(images)
+            if logits.shape[-2:] != labels.shape[-2:]:
+                logits = F.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+            loss = F.cross_entropy(logits, labels)
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -608,8 +520,62 @@ def run_mask2former_epoch(
             class_labels = [labels.to(device) for labels in batch["class_labels"]]
             outputs = model(pixel_values=images, mask_labels=mask_labels, class_labels=class_labels)
             loss = outputs.loss
-            if loss is None:
-                raise RuntimeError("Mask2Former did not return a training loss.")
+            if is_train:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+    return {"loss": float(np.mean(losses)) if losses else 0.0}
+
+
+def dice_bce_loss(pred_masks: torch.Tensor, target_masks: torch.Tensor) -> torch.Tensor:
+    if pred_masks.ndim == 4 and pred_masks.shape[1] == 1:
+        pred_masks = pred_masks[:, 0]
+    target = F.interpolate(target_masks[:, None].float(), size=pred_masks.shape[-2:], mode="nearest")[:, 0]
+    bce = F.binary_cross_entropy_with_logits(pred_masks, target)
+    probs = pred_masks.sigmoid()
+    intersection = (probs * target).sum(dim=(1, 2))
+    union = probs.sum(dim=(1, 2)) + target.sum(dim=(1, 2))
+    dice = 1.0 - ((2.0 * intersection + 1.0) / (union + 1.0))
+    return bce + dice.mean()
+
+
+def sam_prompt_instances(batch: dict[str, object]) -> tuple[list[Image.Image], list[list[list[float]]], torch.Tensor]:
+    images: list[Image.Image] = []
+    input_boxes: list[list[list[float]]] = []
+    masks: list[torch.Tensor] = []
+    for pil_image, boxes, mask_labels in zip(batch["pil_images"], batch["boxes"], batch["mask_labels"]):
+        for box, mask in zip(boxes, mask_labels):
+            images.append(pil_image)
+            input_boxes.append([[float(value) for value in box.tolist()]])
+            masks.append(mask)
+    if not masks:
+        return [], [], torch.zeros((0, 1, 1), dtype=torch.float32)
+    return images, input_boxes, torch.stack(masks)
+
+
+def run_sam_epoch(
+    model: nn.Module,
+    processor: object,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> dict[str, float]:
+    is_train = optimizer is not None
+    model.train(is_train)
+    losses: list[float] = []
+    with torch.set_grad_enabled(is_train):
+        for batch in tqdm(loader, leave=False):
+            images, input_boxes, target_masks = sam_prompt_instances(batch)
+            if not images:
+                continue
+            inputs = processor(images=images, input_boxes=input_boxes, return_tensors="pt")
+            inputs = {key: value.to(device) if torch.is_tensor(value) else value for key, value in inputs.items()}
+            outputs = model(**inputs, multimask_output=False)
+            pred_masks = outputs.pred_masks
+            while pred_masks.ndim > 3:
+                pred_masks = pred_masks[:, 0]
+            loss = dice_bce_loss(pred_masks, target_masks.to(device))
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -634,12 +600,8 @@ def train_torch_model(
     best_value = -float("inf") if maximize else float("inf")
     history: list[dict[str, object]] = []
     for epoch in range(1, args.epochs + 1):
-        if architecture == "mask2former":
-            train_metrics = epoch_runner(model_api.module, train_loader, model_api.device, optimizer)
-            valid_metrics = epoch_runner(model_api.module, valid_loader, model_api.device, None)
-        else:
-            train_metrics = epoch_runner(model_api.module, train_loader, architecture, model_api.device, optimizer)
-            valid_metrics = epoch_runner(model_api.module, valid_loader, architecture, model_api.device, None)
+        train_metrics = epoch_runner(model_api.module, train_loader, model_api.device, optimizer)
+        valid_metrics = epoch_runner(model_api.module, valid_loader, model_api.device, None)
         row = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics}
         history.append(row)
         print(json.dumps(row, indent=2))
@@ -649,20 +611,42 @@ def train_torch_model(
         if improved:
             best_value = current
             model_api.save(arch_output_dir / "best.pt", args.image_size, valid_metrics)
-    with (arch_output_dir / "history.json").open("w", encoding="utf-8") as file:
-        json.dump(history, file, indent=2)
+    (arch_output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+
+def train_sam(args: argparse.Namespace) -> None:
+    arch_output_dir = ensure_dir(Path(args.output_dir) / "sam")
+    train_loader, valid_loader = make_instance_loaders(args)
+    config = ModelConfig(architecture="sam", model_name_or_path=args.model_name_or_path).normalized()
+    model_api = ModelAPI.create(config).prepare_for_training(args.device)
+    if not args.train_sam_encoders:
+        for name, parameter in model_api.module.named_parameters():
+            if name.startswith(("vision_encoder", "prompt_encoder")):
+                parameter.requires_grad = False
+    optimizer = torch.optim.AdamW((p for p in model_api.module.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
+    processor = build_sam_processor(config.model_name_or_path)
+    best_value = float("inf")
+    history: list[dict[str, object]] = []
+    for epoch in range(1, args.epochs + 1):
+        train_metrics = run_sam_epoch(model_api.module, processor, train_loader, model_api.device, optimizer)
+        valid_metrics = run_sam_epoch(model_api.module, processor, valid_loader, model_api.device, None)
+        row = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics}
+        history.append(row)
+        print(json.dumps(row, indent=2))
+        model_api.save(arch_output_dir / "last.pt", args.image_size, valid_metrics)
+        if valid_metrics["loss"] < best_value:
+            best_value = valid_metrics["loss"]
+            model_api.save(arch_output_dir / "best.pt", args.image_size, valid_metrics)
+    (arch_output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
 
 
 def polygon_to_yolo_line(ann_code: int, polygon: list[list[tuple[float, float]]], size: tuple[int, int]) -> str | None:
     width, height = size
-    exterior = polygon[0]
-    points = []
-    for x, y in exterior:
-        points.append((max(0.0, min(1.0, x / width)), max(0.0, min(1.0, y / height))))
+    points = [(max(0.0, min(1.0, x / width)), max(0.0, min(1.0, y / height))) for x, y in polygon[0]]
     if len({(round(x, 6), round(y, 6)) for x, y in points}) < 3:
         return None
     coords = " ".join(coord for point in points for coord in (f"{point[0]:.6f}", f"{point[1]:.6f}"))
-    return f"{ANN_CODE_TO_YOLO_ID[ann_code]} {coords}"
+    return f"{ANN_CODE_TO_MODEL_ID[ann_code]} {coords}"
 
 
 def write_yolo_label(label_path: Path, output_path: Path, size: tuple[int, int]) -> None:
@@ -676,58 +660,30 @@ def write_yolo_label(label_path: Path, output_path: Path, size: tuple[int, int])
             if line is not None:
                 lines.append(line)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_file(output_path, "\n".join(lines) + ("\n" if lines else ""))
-
-
-def link_or_copy(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        return
-    try:
-        os.link(source, target)
-    except OSError:
-        shutil.copy2(source, target)
+    output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def write_yolo_rgb_image(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        return
-    image = load_rgb_image(source).convert("RGB")
-    image.save(target)
+    if not target.exists():
+        load_rgb_image(source).convert("RGB").save(target)
 
 
 def prepare_yolo_dataset(args: argparse.Namespace) -> Path:
     train_samples, valid_samples = split_samples(args)
     yolo_root = ensure_dir(Path(args.prepared_dir) / "yolo_rgb")
     data_yaml = yolo_root / "data.yaml"
-    cached_train_labels = list((yolo_root / "labels" / "train").glob("*.txt"))
-    cached_val_labels = list((yolo_root / "labels" / "val").glob("*.txt"))
-    cached_train_images = list((yolo_root / "images" / "train").glob("*.png"))
-    cached_val_images = list((yolo_root / "images" / "val").glob("*.png"))
-    if data_yaml.is_file() and cached_train_labels and cached_val_labels and cached_train_images and cached_val_images and not args.force_prepare:
-        print(f"Reusing prepared YOLO dataset: {data_yaml}")
-        print("Use --force-prepare to rebuild YOLO labels from GeoJSON.")
+    if data_yaml.is_file() and not args.force_prepare:
         return data_yaml
-
-    print(
-        "Preparing YOLO dataset from GeoJSON labels. This step is CPU-bound and can take a long time on the full dataset. "
-        "Images are converted to 3-channel RGB PNG to avoid mixed TIF channel counts during YOLO mosaic augmentation."
-    )
     for split_name, samples in (("train", train_samples), ("val", valid_samples)):
         for image_path, label_path in tqdm(samples, desc=f"prepare-yolo-{split_name}", leave=False):
             image_output = yolo_root / "images" / split_name / f"{image_path.stem}.png"
             label_output = yolo_root / "labels" / split_name / f"{image_path.stem}.txt"
             write_yolo_rgb_image(image_path, image_output)
             write_yolo_label(label_path, label_output, image_size(image_path))
-    lines = [
-        f"path: {yolo_root.resolve().as_posix()}",
-        "train: images/train",
-        "val: images/val",
-        "names:",
-    ]
-    lines.extend(f"  {idx}: {name}" for idx, name in YOLO_ID_TO_NAME.items())
-    write_text_file(data_yaml, "\n".join(lines) + "\n")
+    lines = [f"path: {yolo_root.resolve().as_posix()}", "train: images/train", "val: images/val", "names:"]
+    lines.extend(f"  {idx}: {name}" for idx, name in MODEL_ID_TO_NAME.items())
+    data_yaml.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return data_yaml
 
 
@@ -741,28 +697,43 @@ def export_semantic_masks(args: argparse.Namespace) -> None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             Image.fromarray(mask, mode="L").save(output_path)
     metadata = {
-        "crs": f"EPSG:{LABEL_CRS_EPSG}",
+        "input_crs": f"EPSG:{LABEL_CRS_EPSG}",
+        "analysis_crs": f"EPSG:{ANALYSIS_CRS_EPSG}",
         "output_crs": "pixel",
         "classes": TRAIN_ID_TO_NAME,
         "note": "GeoJSON coordinates are mapped to image pixel space from label tile bounds. No metric CRS operation is performed.",
     }
-    write_text_file(root / "metadata.json", json.dumps(metadata, indent=2))
+    (root / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def prepare_all_datasets(args: argparse.Namespace) -> None:
+    export_semantic_masks(args)
+    prepare_yolo_dataset(args)
+    root = ensure_dir(args.prepared_dir)
+    metadata = {
+        "classes": [item.__dict__ for item in CLASSES],
+        "label_crs": f"EPSG:{LABEL_CRS_EPSG}",
+        "output_crs": "pixel",
+        "spatial_operation": "pixel-space rasterization only",
+    }
+    (root / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def normalize_yolo_device(device: str | None) -> str | None:
+    if device is None:
+        return None
+    normalized = str(device).strip().lower()
+    if normalized in {"", "none"}:
+        return None
+    if normalized == "cpu":
+        return "cpu"
+    return normalized.replace("cuda:", "")
 
 
 def train_yolo(args: argparse.Namespace) -> None:
     arch_output_dir = ensure_dir(Path(args.output_dir) / "yolo")
     data_yaml = prepare_yolo_dataset(args)
     model = build_yolo_model(args.model_name_or_path)
-    yolo_device = normalize_yolo_device(args.device)
-    if yolo_device and yolo_device != "cpu":
-        try:
-            from ultralytics.utils.torch_utils import select_device
-        except ImportError:
-            select_device = None
-        print(f"YOLO requested device: {yolo_device}")
-        print(f"YOLO torch: {torch.__version__}, cuda={torch.version.cuda}, available={torch.cuda.is_available()}, count={torch.cuda.device_count()}")
-        if select_device is not None:
-            print(f"YOLO selected device: {select_device(yolo_device)}")
     train_kwargs = {
         "data": str(data_yaml.resolve()),
         "task": "segment",
@@ -775,9 +746,9 @@ def train_yolo(args: argparse.Namespace) -> None:
         "exist_ok": True,
         "workers": args.num_workers,
     }
+    yolo_device = normalize_yolo_device(args.device)
     if yolo_device:
         train_kwargs["device"] = yolo_device
-    print(f"Starting Ultralytics YOLO training with device={train_kwargs.get('device', 'auto')}")
     results = model.train(**train_kwargs)
     save_dir = Path(getattr(results, "save_dir", arch_output_dir / "train"))
     weights_dir = save_dir / "weights"
@@ -788,68 +759,34 @@ def train_yolo(args: argparse.Namespace) -> None:
         shutil.copy2(source, arch_output_dir / name)
 
 
-def train_unet_or_segformer(args: argparse.Namespace, architecture: str) -> None:
+def train_unet(args: argparse.Namespace) -> None:
     train_loader, valid_loader = make_semantic_loaders(args)
-    train_torch_model(
-        args=args,
-        architecture=architecture,
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        epoch_runner=run_semantic_epoch,
-        monitor_metric="mean_iou",
-        maximize=True,
-    )
+    train_torch_model(args, "unet", train_loader, valid_loader, run_unet_epoch, "mean_iou", True)
 
 
 def train_mask2former(args: argparse.Namespace) -> None:
-    train_loader, valid_loader = make_mask2former_loaders(args)
-    train_torch_model(
-        args=args,
-        architecture="mask2former",
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        epoch_runner=run_mask2former_epoch,
-        monitor_metric="loss",
-        maximize=False,
-    )
-
-
-def prepare_all_datasets(args: argparse.Namespace) -> None:
-    export_semantic_masks(args)
-    prepare_yolo_dataset(args)
-    metadata = {
-        "classes": [item.__dict__ for item in CLASSES],
-        "semantic_id2label": TRAIN_ID_TO_NAME,
-        "mask2former_id2label": MASK2FORMER_ID_TO_NAME,
-        "label_crs": f"EPSG:{LABEL_CRS_EPSG}",
-        "analysis": "pixel-space mask generation from EPSG:5186 label tile bounds",
-    }
-    root = ensure_dir(args.prepared_dir)
-    write_text_file(root / "metadata.json", json.dumps(metadata, indent=2))
+    train_loader, valid_loader = make_instance_loaders(args)
+    train_torch_model(args, "mask2former", train_loader, valid_loader, run_mask2former_epoch, "loss", False)
 
 
 TRAIN_DISPATCH = {
     "yolo": train_yolo,
-    "unet": lambda args: train_unet_or_segformer(args, "unet"),
-    "segformer": lambda args: train_unet_or_segformer(args, "segformer"),
+    "unet": train_unet,
     "mask2former": train_mask2former,
+    "sam": train_sam,
 }
 
 
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
-    if args.device and args.device.lower() != "cpu":
-        print(f"Requested CUDA device(s): {args.device}")
-        print(f"torch.cuda.is_available(): {torch.cuda.is_available()}")
-        print(f"torch.cuda.device_count(): {torch.cuda.device_count()}")
     if args.prepare_only:
         prepare_all_datasets(args)
         print(f"Prepared datasets written to {Path(args.prepared_dir).resolve()}")
         return
     if args.architecture == "all" and args.model_name_or_path:
         raise ValueError("--model-name-or-path can target only one architecture. Run each architecture separately when overriding it.")
-    architectures = ("yolo", "unet", "segformer", "mask2former") if args.architecture == "all" else (args.architecture,)
+    architectures = ("yolo", "unet", "mask2former", "sam") if args.architecture == "all" else (args.architecture,)
     for architecture in architectures:
         print(f"Training {architecture} -> {Path(args.output_dir) / architecture}")
         TRAIN_DISPATCH[architecture](args)

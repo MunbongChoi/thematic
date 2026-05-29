@@ -1,6 +1,4 @@
-# CUDA 12.2 driver/runtime systems should use PyTorch's official CUDA 12.1
-# wheels. PyTorch does not publish a separate stable pip index named cu122.
---index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://download.pytorch.org/whl/cu121
 torch
 torchvision
 torchaudio
