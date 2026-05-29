@@ -71,6 +71,23 @@ def save_overlay(image: Image.Image, mask: np.ndarray, output_path: Path, alpha:
     Image.alpha_composite(image_rgba, Image.fromarray(overlay, mode="RGBA")).save(output_path)
 
 
+def panoptic_id_to_rgb(mask: np.ndarray) -> Image.Image:
+    rgb = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    rgb[:, :, 0] = mask % 256
+    rgb[:, :, 1] = (mask // 256) % 256
+    rgb[:, :, 2] = (mask // 65536) % 256
+    return Image.fromarray(rgb, mode="RGB")
+
+
+def mask_bbox(mask: np.ndarray) -> list[int]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0 or len(ys) == 0:
+        return [0, 0, 0, 0]
+    min_x, max_x = int(xs.min()), int(xs.max())
+    min_y, max_y = int(ys.min()), int(ys.max())
+    return [min_x, min_y, max_x - min_x + 1, max_y - min_y + 1]
+
+
 def class_summary(mask: np.ndarray) -> dict[str, int]:
     summary: dict[str, int] = {}
     for class_id, class_name in TRAIN_ID_TO_NAME.items():
@@ -80,20 +97,55 @@ def class_summary(mask: np.ndarray) -> dict[str, int]:
     return summary
 
 
-def save_semantic_outputs(image_path: Path, image: Image.Image, mask: np.ndarray, output_dir: Path) -> dict[str, object]:
-    mask_path = output_dir / f"{image_path.stem}_mask.png"
+def panoptic_from_semantic(mask: np.ndarray) -> tuple[np.ndarray, list[dict[str, object]]]:
+    panoptic = np.zeros(mask.shape, dtype=np.int32)
+    segments: list[dict[str, object]] = []
+    next_segment_id = 1
+    for train_id in sorted(int(value) for value in np.unique(mask) if int(value) != 0):
+        segment_mask = mask == train_id
+        area = int(segment_mask.sum())
+        if area == 0:
+            continue
+        panoptic[segment_mask] = next_segment_id
+        segments.append(
+            {
+                "id": next_segment_id,
+                "category_id": train_id,
+                "train_id": train_id,
+                "class_name": TRAIN_ID_TO_NAME.get(train_id, str(train_id)),
+                "area": area,
+                "bbox": mask_bbox(segment_mask),
+            }
+        )
+        next_segment_id += 1
+    return panoptic, segments
+
+
+def save_panoptic_outputs(
+    image_path: Path,
+    image: Image.Image,
+    semantic: np.ndarray,
+    panoptic: np.ndarray,
+    segments: list[dict[str, object]],
+    output_dir: Path,
+) -> dict[str, object]:
+    mask_path = output_dir / f"{image_path.stem}_semantic_mask.png"
     color_path = output_dir / f"{image_path.stem}_color.png"
+    panoptic_path = output_dir / f"{image_path.stem}_panoptic.png"
     overlay_path = output_dir / f"{image_path.stem}_overlay.png"
-    Image.fromarray(mask.astype(np.uint8), mode="L").save(mask_path)
-    colorize_mask(mask).save(color_path)
-    save_overlay(image, mask, overlay_path)
+    Image.fromarray(semantic.astype(np.uint8), mode="L").save(mask_path)
+    colorize_mask(semantic).save(color_path)
+    panoptic_id_to_rgb(panoptic.astype(np.int32)).save(panoptic_path)
+    save_overlay(image, semantic, overlay_path)
     return {
         "image": str(image_path),
-        "mask": str(mask_path),
+        "semantic_mask": str(mask_path),
+        "panoptic_mask": str(panoptic_path),
         "color_mask": str(color_path),
         "overlay": str(overlay_path),
-        "pixel_counts": class_summary(mask),
-        "crs_note": "Output is a pixel-space segmentation mask. No distance/area CRS operation is performed.",
+        "pixel_counts": class_summary(semantic),
+        "segments_info": segments,
+        "crs_note": "Output is a pixel-space panoptic segmentation. No distance/area CRS operation is performed.",
     }
 
 
@@ -111,7 +163,8 @@ def run_torch_semantic(args: argparse.Namespace, architecture: str, model: torch
             logits, _ = logits_from_model(model, architecture, tensor)
             logits = F.interpolate(logits, size=(image.height, image.width), mode="bilinear", align_corners=False)
             mask = logits.argmax(dim=1)[0].detach().cpu().numpy().astype(np.uint8)
-        results.append(save_semantic_outputs(image_path, image, mask, output_dir))
+        panoptic, segments = panoptic_from_semantic(mask)
+        results.append(save_panoptic_outputs(image_path, image, mask, panoptic, segments, output_dir))
     (output_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
 
 
@@ -135,27 +188,36 @@ def run_yolo(args: argparse.Namespace) -> None:
         image_path = Path(result.path)
         image = Image.fromarray(result.orig_img[:, :, ::-1]).convert("RGB")
         semantic = np.zeros((image.height, image.width), dtype=np.uint8)
-        instances: list[dict[str, object]] = []
+        panoptic = np.zeros((image.height, image.width), dtype=np.int32)
+        segments: list[dict[str, object]] = []
+        next_segment_id = 1
         if result.masks is not None and result.boxes is not None:
             masks = result.masks.data.detach().cpu()
             classes = result.boxes.cls.detach().cpu().numpy().astype(int)
             confidences = result.boxes.conf.detach().cpu().numpy()
-            for idx, (mask_tensor, yolo_id, confidence) in enumerate(zip(masks, classes, confidences), start=1):
+            for mask_tensor, yolo_id, confidence in zip(masks, classes, confidences):
                 mask_image = Image.fromarray((mask_tensor.numpy() > 0.5).astype(np.uint8), mode="L").resize(image.size, Image.NEAREST)
-                instance_mask = np.asarray(mask_image, dtype=bool)
+                instance_mask = np.asarray(mask_image, dtype=bool) & (panoptic == 0)
+                area = int(instance_mask.sum())
+                if area == 0:
+                    continue
                 train_id = YOLO_ID_TO_TRAIN_ID.get(int(yolo_id), 0)
                 semantic[instance_mask] = train_id
-                instances.append(
+                panoptic[instance_mask] = next_segment_id
+                segments.append(
                     {
-                        "id": idx,
+                        "id": next_segment_id,
+                        "category_id": train_id,
+                        "train_id": train_id,
                         "yolo_class_id": int(yolo_id),
                         "class_name": YOLO_ID_TO_NAME.get(int(yolo_id), str(yolo_id)),
                         "confidence": float(confidence),
-                        "pixel_count": int(instance_mask.sum()),
+                        "area": area,
+                        "bbox": mask_bbox(instance_mask),
                     }
                 )
-        row = save_semantic_outputs(image_path, image, semantic, output_dir)
-        row["instances"] = instances
+                next_segment_id += 1
+        row = save_panoptic_outputs(image_path, image, semantic, panoptic, segments, output_dir)
         results.append(row)
     (output_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
 
@@ -186,21 +248,23 @@ def run_mask2former(args: argparse.Namespace, model: torch.nn.Module, checkpoint
             label_id = int(info.get("label_id", info.get("category_id", 0)))
             train_id = YOLO_ID_TO_TRAIN_ID.get(label_id, 0)
             segment_mask = panoptic == int(info["id"])
+            area = int(segment_mask.sum())
+            if area == 0:
+                continue
             semantic[segment_mask] = train_id
             segments.append(
                 {
                     "id": int(info["id"]),
+                    "category_id": train_id,
+                    "train_id": train_id,
                     "label_id": label_id,
                     "class_name": MASK2FORMER_ID_TO_NAME.get(label_id, str(label_id)),
                     "score": float(info.get("score", 0.0)),
-                    "pixel_count": int(segment_mask.sum()),
+                    "area": area,
+                    "bbox": mask_bbox(segment_mask),
                 }
             )
-        row = save_semantic_outputs(image_path, image, semantic, output_dir)
-        panoptic_path = output_dir / f"{image_path.stem}_panoptic_ids.png"
-        Image.fromarray(np.clip(panoptic, 0, 255).astype(np.uint8), mode="L").save(panoptic_path)
-        row["panoptic_ids"] = str(panoptic_path)
-        row["segments"] = segments
+        row = save_panoptic_outputs(image_path, image, semantic, panoptic.astype(np.int32), segments, output_dir)
         results.append(row)
     (output_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
 
@@ -233,4 +297,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

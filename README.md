@@ -1,6 +1,7 @@
 # Segmentation Training Pipeline
 
-This project trains multiple segmentation models on the GeoJSON/TIF dataset.
+This project trains multiple segmentation models on the GeoJSON/TIF dataset and
+saves inference outputs as pixel-space panoptic segmentation results.
 
 Supported classes are building, parking lot, road, street tree, paddy field,
 greenhouse, field, broadleaf forest, coniferous forest, bare ground, water, and
@@ -61,5 +62,14 @@ python infer.py --architecture auto --checkpoint runs/segmentation/unet/best.pt 
 python infer.py --architecture yolo --checkpoint runs/segmentation/yolo/best.pt --input dataset/test/image --output-dir outputs/infer/yolo
 ```
 
-Inference writes class-id masks, color masks, overlays, and `results.json`.
+Inference writes:
 
+- `*_panoptic.png`: RGB-encoded panoptic segment id mask
+- `*_semantic_mask.png`: class id mask
+- `*_color.png`: colored class mask
+- `*_overlay.png`: overlay on the source image
+- `results.json`: `segments_info`, class pixel counts, and output paths
+
+`Mask2Former` uses model panoptic post-processing directly. YOLO predictions are
+saved as instance segments. UNet and SegFormer are semantic models, so their
+class regions are converted to panoptic-style segments at inference time.
