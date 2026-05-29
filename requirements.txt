@@ -1,10 +1,7 @@
 numpy
 Pillow
 tqdm
-torch
-torchvision
 transformers
 ultralytics
 rasterio
 shapely
-

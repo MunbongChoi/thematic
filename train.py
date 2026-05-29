@@ -5,6 +5,7 @@ import json
 import os
 import random
 import shutil
+import tempfile
 import warnings
 from pathlib import Path
 from typing import Callable, Iterable
@@ -82,6 +83,62 @@ def ensure_dir(path: str | Path) -> Path:
     output_dir = Path(path)
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def normalize_yolo_device(device: str | None) -> str | None:
+    if device is None:
+        return None
+    normalized = str(device).strip().lower()
+    if normalized in {"", "none"}:
+        return None
+    if normalized == "cpu":
+        return "cpu"
+    return normalized.replace("cuda:", "")
+
+
+def write_text_file(path: Path, content: str) -> None:
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            path.chmod(0o666)
+        except OSError:
+            pass
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            file.write(content)
+            temp_path = Path(file.name)
+        try:
+            os.replace(temp_path, path)
+        except PermissionError:
+            if path.exists():
+                try:
+                    path.chmod(0o666)
+                except OSError:
+                    pass
+                path.unlink()
+            os.replace(temp_path, path)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Cannot write prepared output file: {path}\n"
+            "Check directory/file ownership and write permission, or use a writable prepared directory:\n"
+            "  python train.py ... --prepared-dir <writable_path>\n"
+            "On Linux servers, this often means the previous outputs were created by another user/root; "
+            "fix ownership with chown/chmod or choose a new --prepared-dir."
+        ) from exc
+    finally:
+        try:
+            if "temp_path" in locals() and temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
 
 
 def array_to_uint8_rgb(array: np.ndarray) -> np.ndarray:
@@ -616,7 +673,7 @@ def write_yolo_label(label_path: Path, output_path: Path, size: tuple[int, int])
             if line is not None:
                 lines.append(line)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    write_text_file(output_path, "\n".join(lines) + ("\n" if lines else ""))
 
 
 def link_or_copy(source: Path, target: Path) -> None:
@@ -646,7 +703,7 @@ def prepare_yolo_dataset(args: argparse.Namespace) -> Path:
         "names:",
     ]
     lines.extend(f"  {idx}: {name}" for idx, name in YOLO_ID_TO_NAME.items())
-    data_yaml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_text_file(data_yaml, "\n".join(lines) + "\n")
     return data_yaml
 
 
@@ -665,13 +722,23 @@ def export_semantic_masks(args: argparse.Namespace) -> None:
         "classes": TRAIN_ID_TO_NAME,
         "note": "GeoJSON coordinates are mapped to image pixel space from label tile bounds. No metric CRS operation is performed.",
     }
-    (root / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    write_text_file(root / "metadata.json", json.dumps(metadata, indent=2))
 
 
 def train_yolo(args: argparse.Namespace) -> None:
     arch_output_dir = ensure_dir(Path(args.output_dir) / "yolo")
     data_yaml = prepare_yolo_dataset(args)
     model = build_yolo_model(args.model_name_or_path)
+    yolo_device = normalize_yolo_device(args.device)
+    if yolo_device and yolo_device != "cpu":
+        try:
+            from ultralytics.utils.torch_utils import select_device
+        except ImportError:
+            select_device = None
+        print(f"YOLO requested device: {yolo_device}")
+        print(f"YOLO torch: {torch.__version__}, cuda={torch.version.cuda}, available={torch.cuda.is_available()}, count={torch.cuda.device_count()}")
+        if select_device is not None:
+            print(f"YOLO selected device: {select_device(yolo_device)}")
     train_kwargs = {
         "data": str(data_yaml.resolve()),
         "task": "segment",
@@ -684,8 +751,8 @@ def train_yolo(args: argparse.Namespace) -> None:
         "exist_ok": True,
         "workers": args.num_workers,
     }
-    if args.device:
-        train_kwargs["device"] = args.device
+    if yolo_device:
+        train_kwargs["device"] = yolo_device
     results = model.train(**train_kwargs)
     save_dir = Path(getattr(results, "save_dir", arch_output_dir / "train"))
     weights_dir = save_dir / "weights"
@@ -733,7 +800,7 @@ def prepare_all_datasets(args: argparse.Namespace) -> None:
         "analysis": "pixel-space mask generation from EPSG:5186 label tile bounds",
     }
     root = ensure_dir(args.prepared_dir)
-    (root / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    write_text_file(root / "metadata.json", json.dumps(metadata, indent=2))
 
 
 TRAIN_DISPATCH = {
@@ -747,6 +814,10 @@ TRAIN_DISPATCH = {
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
+    if args.device and args.device.lower() != "cpu":
+        print(f"Requested CUDA device(s): {args.device}")
+        print(f"torch.cuda.is_available(): {torch.cuda.is_available()}")
+        print(f"torch.cuda.device_count(): {torch.cuda.device_count()}")
     if args.prepare_only:
         prepare_all_datasets(args)
         print(f"Prepared datasets written to {Path(args.prepared_dir).resolve()}")

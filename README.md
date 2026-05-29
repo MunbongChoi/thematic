@@ -27,6 +27,21 @@ or nearest-neighbor values.
 pip install -r requirements.txt
 ```
 
+For GPU training, install a CUDA-enabled PyTorch wheel in the same Python
+environment before training:
+
+```powershell
+pip uninstall -y torch torchvision torchaudio
+pip install -r requirements-gpu-cuda122.txt
+pip install -r requirements.txt
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.device_count())"
+```
+
+For CUDA 12.2 systems this project uses PyTorch's official `cu121` wheel index,
+because PyTorch does not publish a separate stable pip index named `cu122`.
+`nvidia-smi` only proves the driver can see the GPU; PyTorch must also report
+`torch.cuda.is_available() == True`.
+
 ## Prepare Datasets Only
 
 ```powershell
