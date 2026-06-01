@@ -94,13 +94,13 @@ python train.py --architecture mask2former --dataset-root dataset --output-dir r
 
 For RTX 4090 x4, YOLO should not be trained with `--batch-size 4`; that creates a very small per-GPU batch and usually leaves the GPUs underfed. Start with `--batch-size 64`, then reduce to `32` or `16` only if CUDA memory is exhausted. YOLO cache is forced to `False` in code to avoid RAM pressure. Reuse an existing prepared `data.yaml` with `--yolo-data`; otherwise the script reuses the newest `data.yaml` under `--prepared-dir` when one exists. `--num-workers` is per YOLO GPU process, so `--num-workers 4` creates up to 16 loader workers in 4-GPU DDP.
 
-Mask2Former supports multi-GPU `DataParallel` with list-aware `mask_labels` and `class_labels` scatter:
+Mask2Former currently trains on one selected GPU. If multiple GPU ids are passed, the code uses the first id and prints a warning because PyTorch `DataParallel` is unsafe for this Mask2Former batch shape with variable-length `mask_labels` and `class_labels`.
 
 ```powershell
-python train.py --architecture mask2former --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 4 --device 0,1,2,3
+python train.py --architecture mask2former --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 2 --device 0
 ```
 
-Use a batch size at least as large as the number of GPUs if you want every GPU to receive work.
+Use a DDP-specific entrypoint, not `DataParallel`, for true multi-GPU Mask2Former training.
 
 Each model writes:
 

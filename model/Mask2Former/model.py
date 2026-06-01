@@ -48,34 +48,6 @@ def build_model(config: Mask2FormerConfig | None = None) -> nn.Module:
     )
 
 
-class Mask2FormerDataParallel(nn.DataParallel):
-    def scatter(self, inputs, kwargs, device_ids):
-        pixel_values = kwargs.get("pixel_values")
-        mask_labels = kwargs.get("mask_labels")
-        class_labels = kwargs.get("class_labels")
-        if pixel_values is None or mask_labels is None or class_labels is None:
-            return super().scatter(inputs, kwargs, device_ids)
-        batch_size = int(pixel_values.shape[0])
-        split_count = min(len(device_ids), batch_size)
-        base = batch_size // split_count
-        remainder = batch_size % split_count
-        ranges: list[tuple[int, int]] = []
-        start = 0
-        for idx in range(split_count):
-            end = start + base + (1 if idx < remainder else 0)
-            ranges.append((start, end))
-            start = end
-        scattered_kwargs = []
-        for device_id, (start, end) in zip(device_ids[:split_count], ranges):
-            device = torch.device(f"cuda:{device_id}")
-            item = dict(kwargs)
-            item["pixel_values"] = pixel_values[start:end].to(device, non_blocking=True)
-            item["mask_labels"] = [mask.to(device, non_blocking=True) for mask in mask_labels[start:end]]
-            item["class_labels"] = [labels.to(device, non_blocking=True) for labels in class_labels[start:end]]
-            scattered_kwargs.append(item)
-        return [() for _ in scattered_kwargs], scattered_kwargs
-
-
 @dataclass
 class ModelAPI:
     config: Mask2FormerConfig
@@ -92,7 +64,11 @@ class ModelAPI:
         self.module = self.module.to(self.device)
         device_ids = resolve_torch_device_ids(device_arg)
         if self.device.type == "cuda" and len(device_ids) > 1:
-            self.module = Mask2FormerDataParallel(self.module, device_ids=device_ids, output_device=device_ids[0])
+            print(
+                "Mask2Former DataParallel is disabled because its variable-length mask_labels/class_labels "
+                f"can create cross-device tensors. Using cuda:{device_ids[0]}. "
+                "Use a DDP-specific training entrypoint for true multi-GPU Mask2Former training."
+            )
         return self
 
     def save(self, path: str | Path, image_size: int, metrics: dict[str, float] | None = None) -> None:
