@@ -30,6 +30,8 @@ def run_epoch(
             class_labels = [labels.to(device, non_blocking=True) for labels in batch["class_labels"]]
             outputs = model(pixel_values=images, mask_labels=mask_labels, class_labels=class_labels)
             loss = outputs.loss
+            if loss.ndim > 0:
+                loss = loss.mean()
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
