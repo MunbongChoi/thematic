@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-image-format", default="jpg", choices=["jpg", "png"], help="Prepared YOLO image format.")
     parser.add_argument("--yolo-jpeg-quality", type=int, default=95, help="JPEG quality when --yolo-image-format jpg.")
     parser.add_argument("--yolo-amp", action=argparse.BooleanOptionalAction, default=True, help="Enable Ultralytics AMP for YOLO.")
-    parser.add_argument("--device", default=None, help="Use cpu, 0, cuda:0, or 0,1 where supported.")
+    parser.add_argument("--device", default=None, help="Use cpu, 0, or cuda:0. Use torchrun DDP entrypoints for multi-GPU PyTorch models.")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--limit", type=int, default=None, help="Optional sample limit for smoke tests.")
     parser.add_argument("--prepare-only", action="store_true")

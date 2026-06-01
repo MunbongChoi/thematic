@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np  # noqa: F401
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
 from config import MODEL_ID_TO_NAME, NUM_SEGMENT_CLASSES, NUM_SEMANTIC_CLASSES, TRAIN_ID_TO_NAME
 
@@ -87,7 +88,7 @@ def save_checkpoint(
 ) -> None:
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+    model_to_save = model.module if isinstance(model, DistributedDataParallel) else model
     payload = config_to_checkpoint_dict(config)
     torch.save(
         {

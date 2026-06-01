@@ -61,14 +61,13 @@ class ModelAPI:
 
     def prepare_for_training(self, device_arg: str | None = None) -> "ModelAPI":
         self.device = resolve_torch_device(device_arg)
-        self.module = self.module.to(self.device)
         device_ids = resolve_torch_device_ids(device_arg)
         if self.device.type == "cuda" and len(device_ids) > 1:
-            print(
-                "Mask2Former DataParallel is disabled because its variable-length mask_labels/class_labels "
-                f"can create cross-device tensors. Using cuda:{device_ids[0]}. "
-                "Use a DDP-specific training entrypoint for true multi-GPU Mask2Former training."
+            raise ValueError(
+                "Mask2Former multi-GPU training uses DDP, not DataParallel. "
+                "Run: torchrun --nproc_per_node=<num_gpus> -m model.Mask2Former.train_ddp ..."
             )
+        self.module = self.module.to(self.device)
         return self
 
     def save(self, path: str | Path, image_size: int, metrics: dict[str, float] | None = None) -> None:

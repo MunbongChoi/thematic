@@ -88,19 +88,20 @@ Train one model:
 ```powershell
 python train.py --architecture yolo --yolo-data outputs/prepared/yolo_rgb_jpg/data.yaml --output-dir runs/segmentation --epochs 50 --batch-size 64 --device 0,1,2,3 --num-workers 4
 python train.py --architecture yolo26 --yolo-data outputs/prepared/yolo_rgb_jpg/data.yaml --output-dir runs/segmentation --epochs 50 --batch-size 64 --device 0,1,2,3 --num-workers 4
-python train.py --architecture unet --dataset-root dataset --output-dir runs/segmentation --epochs 50
-python train.py --architecture mask2former --dataset-root dataset --output-dir runs/segmentation --epochs 50
+python train.py --architecture unet --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 4 --device 0
+python train.py --architecture mask2former --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 2 --device 0
 ```
 
 For RTX 4090 x4, YOLO should not be trained with `--batch-size 4`; that creates a very small per-GPU batch and usually leaves the GPUs underfed. Start with `--batch-size 64`, then reduce to `32` or `16` only if CUDA memory is exhausted. YOLO cache is forced to `False` in code to avoid RAM pressure. Reuse an existing prepared `data.yaml` with `--yolo-data`; otherwise the script reuses the newest `data.yaml` under `--prepared-dir` when one exists. `--num-workers` is per YOLO GPU process, so `--num-workers 4` creates up to 16 loader workers in 4-GPU DDP.
 
-Mask2Former currently trains on one selected GPU. If multiple GPU ids are passed, the code uses the first id and prints a warning because PyTorch `DataParallel` is unsafe for this Mask2Former batch shape with variable-length `mask_labels` and `class_labels`.
+UNet and Mask2Former use single-GPU training through `train.py`. For multi-GPU training, use their DDP entrypoints. `--batch-size` is per GPU process.
 
 ```powershell
-python train.py --architecture mask2former --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 2 --device 0
+torchrun --nproc_per_node=4 -m model.UNet.train_ddp --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 4 --num-workers 4
+torchrun --nproc_per_node=4 -m model.Mask2Former.train_ddp --dataset-root dataset --output-dir runs/segmentation --epochs 50 --batch-size 1 --num-workers 4
 ```
 
-Use a DDP-specific entrypoint, not `DataParallel`, for true multi-GPU Mask2Former training.
+Do not use `DataParallel` for this project. PyTorch models use DDP for multi-GPU training; YOLO uses Ultralytics' own multi-GPU launch path.
 
 Each model writes:
 

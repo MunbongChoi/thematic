@@ -84,10 +84,13 @@ class ModelAPI:
 
     def prepare_for_training(self, device_arg: str | None = None) -> "ModelAPI":
         self.device = resolve_torch_device(device_arg)
-        self.module = self.module.to(self.device)
         device_ids = resolve_torch_device_ids(device_arg)
         if self.device.type == "cuda" and len(device_ids) > 1:
-            self.module = nn.DataParallel(self.module, device_ids=device_ids, output_device=device_ids[0])
+            raise ValueError(
+                "UNet multi-GPU training uses DDP, not DataParallel. "
+                "Run: torchrun --nproc_per_node=<num_gpus> -m model.UNet.train_ddp ..."
+            )
+        self.module = self.module.to(self.device)
         return self
 
     def save(self, path: str | Path, image_size: int, metrics: dict[str, float] | None = None) -> None:
