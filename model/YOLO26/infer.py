@@ -8,6 +8,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from config import MODEL_ID_TO_NAME, MODEL_ID_TO_TRAIN_ID
+from data import load_rgb_image
 from infer_common import iter_images, mask_bbox, parse_gsd_args, require_output_crs, save_panoptic_outputs
 from model.YOLO26.model import build_yolo_model
 
@@ -29,14 +30,12 @@ def run_inference(args) -> None:
         predict_kwargs["device"] = args.device
     results: list[dict[str, object]] = []
     for source_image in tqdm(images, desc="infer-yolo26"):
-        predictions = model.predict(source=str(source_image), stream=False, **predict_kwargs)
+        image_path = Path(source_image)
+        image = load_rgb_image(image_path).convert("RGB")
+        predictions = model.predict(source=image, stream=False, **predict_kwargs)
         if len(predictions) != 1:
             raise RuntimeError(f"Expected one YOLO prediction for {source_image}, got {len(predictions)}.")
         result = predictions[0]
-        image_path = Path(result.path)
-        if image_path.suffix.lower() not in {".tif", ".tiff"}:
-            raise ValueError(f"YOLO inference output came from unsupported input {image_path}. Expected .tif or .tiff.")
-        image = Image.fromarray(result.orig_img[:, :, ::-1]).convert("RGB")
         semantic = np.zeros((image.height, image.width), dtype=np.uint8)
         panoptic = np.zeros((image.height, image.width), dtype=np.int32)
         segments: list[dict[str, object]] = []

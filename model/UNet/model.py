@@ -43,6 +43,17 @@ def _group_norm(num_channels: int) -> nn.GroupNorm:
     return nn.GroupNorm(1, num_channels)
 
 
+def ensure_rgb_tensor(x: torch.Tensor) -> torch.Tensor:
+    if x.ndim != 4:
+        raise ValueError(f"UNet expects input tensor shaped NxCxHxW, got {tuple(x.shape)}.")
+    channels = int(x.shape[1])
+    if channels == 3:
+        return x
+    if channels > 3:
+        return x[:, :3]
+    raise ValueError(f"UNet expects RGB input with at least 3 channels, got {channels} channel(s).")
+
+
 class ConvBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
@@ -79,6 +90,7 @@ class UNet(nn.Module):
         self.head = nn.Conv2d(base_channels, num_labels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = ensure_rgb_tensor(x)
         enc1 = self.enc1(x)
         enc2 = self.enc2(self.pool(enc1))
         enc3 = self.enc3(self.pool(enc2))
@@ -181,6 +193,7 @@ class ResidualAttentionUNet(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = ensure_rgb_tensor(x)
         enc1 = self.enc1(x)
         enc2 = self.enc2(self.pool(enc1))
         enc3 = self.enc3(self.pool(enc2))

@@ -51,8 +51,12 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def array_to_uint8_rgb(array: np.ndarray) -> np.ndarray:
-    if array.ndim != 3 or array.shape[-1] != 3:
-        raise ValueError(f"Expected RGB array with shape HxWx3, got {array.shape}.")
+    if array.ndim != 3:
+        raise ValueError(f"Expected RGB array with shape HxWxC, got {array.shape}.")
+    if array.shape[-1] < 3:
+        raise ValueError(f"Expected at least 3 image channels for RGB input, got {array.shape[-1]} channel(s).")
+    if array.shape[-1] > 3:
+        array = array[..., :3]
     if array.dtype == np.uint8:
         return array
     if np.issubdtype(array.dtype, np.integer):
