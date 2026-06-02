@@ -65,7 +65,8 @@ def main() -> None:
         return
 
     try:
-        model, checkpoint = load_checkpoint(args.checkpoint, map_location=device)
+        print(f"Loading checkpoint on CPU: {args.checkpoint}", flush=True)
+        model, checkpoint = load_checkpoint(args.checkpoint, map_location="cpu")
     except Exception:
         if args.architecture == "auto":
             run_yolo(args)
@@ -78,10 +79,12 @@ def main() -> None:
     if architecture == "unet":
         from model.UNet.infer import run_inference as run_unet
 
+        print(f"Running UNet inference on {device}", flush=True)
         run_unet(args, model, checkpoint, device)
     elif architecture == "mask2former":
         from model.Mask2Former.infer import run_inference as run_mask2former
 
+        print(f"Running Mask2Former inference on {device}", flush=True)
         run_mask2former(args, model, checkpoint, device)
     else:
         raise ValueError(f"Unsupported checkpoint architecture: {architecture}")

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from tqdm import tqdm
 
 from data import load_rgb_image
 from infer_common import iter_images, mask_bbox, parse_gsd_args, require_output_crs, save_panoptic_outputs
@@ -48,7 +49,8 @@ def samgeo_predict_mask(sam: object, image_path: Path, image_size: tuple[int, in
 def run_inference(args, device: torch.device) -> None:
     output_crs = require_output_crs(args.output_crs)
     gsd = parse_gsd_args(args)
-    source_model, source_checkpoint = load_checkpoint(args.prompt_source_mask2former_checkpoint, map_location=device)
+    print(f"Loading Mask2Former prompt checkpoint on CPU: {args.prompt_source_mask2former_checkpoint}", flush=True)
+    source_model, source_checkpoint = load_checkpoint(args.prompt_source_mask2former_checkpoint, map_location="cpu")
     source_model.to(device)
     source_model.eval()
     source_processor = build_processor(source_checkpoint.get("model_name_or_path"))
@@ -57,7 +59,8 @@ def run_inference(args, device: torch.device) -> None:
     results: list[dict[str, object]] = []
     with tempfile.TemporaryDirectory(prefix="samgeo_") as temp_name:
         temp_dir = Path(temp_name)
-        for image_path in iter_images(Path(args.input)):
+        images = iter_images(Path(args.input))
+        for image_path in tqdm(images, desc="infer-geosam"):
             image = load_rgb_image(image_path)
             _, _, prompt_segments = mask2former_predict(
                 source_model,

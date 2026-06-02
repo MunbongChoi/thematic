@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from config import MODEL_ID_TO_NAME, MODEL_ID_TO_TRAIN_ID
 from data import load_rgb_image
@@ -65,7 +66,8 @@ def run_inference(args, model: torch.nn.Module, checkpoint: dict, device: torch.
     model.eval()
     processor = build_processor(checkpoint.get("model_name_or_path"))
     results: list[dict[str, object]] = []
-    for image_path in iter_images(Path(args.input)):
+    images = iter_images(Path(args.input))
+    for image_path in tqdm(images, desc="infer-mask2former"):
         image = load_rgb_image(image_path)
         semantic, panoptic, segments = predict(model, checkpoint, image, device, args.image_size, processor, prepared=True)
         results.append(save_panoptic_outputs(image_path, image, semantic, panoptic, segments, output_dir, output_crs, gsd, args.reference_label_root))

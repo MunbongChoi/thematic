@@ -152,7 +152,10 @@ def build_model_for_checkpoint(checkpoint: dict[str, Any]) -> nn.Module:
 
 def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> tuple[nn.Module, dict[str, Any]]:
     checkpoint_path = resolve_checkpoint_path(path)
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
     model = build_model_for_checkpoint(checkpoint)
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     return model, checkpoint

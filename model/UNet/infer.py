@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from data import load_rgb_image
 from infer_common import image_to_tensor, iter_images, panoptic_from_semantic, parse_gsd_args, require_output_crs, save_panoptic_outputs
@@ -18,7 +19,8 @@ def run_inference(args, model: torch.nn.Module, checkpoint: dict, device: torch.
     model.eval()
     image_size = int(checkpoint.get("image_size", args.image_size))
     results: list[dict[str, object]] = []
-    for image_path in iter_images(Path(args.input)):
+    images = iter_images(Path(args.input))
+    for image_path in tqdm(images, desc="infer-unet"):
         image = load_rgb_image(image_path)
         tensor = image_to_tensor(image, image_size).unsqueeze(0).to(device, non_blocking=True)
         with torch.inference_mode():
