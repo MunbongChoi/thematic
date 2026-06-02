@@ -129,7 +129,11 @@ Inference writes:
 - `*_segments.geojson`
 - `results.json`
 
-`--output-crs` is required before GeoJSON can be written. The input TIFF must have a raster CRS matching `--output-crs`; the code does not silently reproject or invent a coordinate system.
+`--output-crs` is required before GeoJSON can be written. The input TIFF should have a raster CRS matching `--output-crs`; the code does not silently reproject or invent a coordinate system. If the TIFF has no raster CRS but a matching EPSG:5186 label GeoJSON exists, provide the label root so the tile bounds can be recovered explicitly:
+
+```powershell
+python infer.py --architecture unet --checkpoint runs/segmentation/unet/best.pt --input dataset/valid/image --output-dir outputs/infer/unet --output-crs EPSG:5186 --reference-label-root dataset/valid/label --gsd-m 0.5 --device 0
+```
 
 Each GeoJSON feature includes:
 

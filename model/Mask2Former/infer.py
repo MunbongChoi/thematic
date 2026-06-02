@@ -68,5 +68,5 @@ def run_inference(args, model: torch.nn.Module, checkpoint: dict, device: torch.
     for image_path in iter_images(Path(args.input)):
         image = load_rgb_image(image_path)
         semantic, panoptic, segments = predict(model, checkpoint, image, device, args.image_size, processor, prepared=True)
-        results.append(save_panoptic_outputs(image_path, image, semantic, panoptic, segments, output_dir, output_crs, gsd))
+        results.append(save_panoptic_outputs(image_path, image, semantic, panoptic, segments, output_dir, output_crs, gsd, args.reference_label_root))
     (output_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")

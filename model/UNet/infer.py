@@ -26,5 +26,5 @@ def run_inference(args, model: torch.nn.Module, checkpoint: dict, device: torch.
             logits = F.interpolate(logits, size=(image.height, image.width), mode="bilinear", align_corners=False)
             semantic = logits.argmax(dim=1)[0].detach().cpu().numpy().astype("uint8")
         panoptic, segments = panoptic_from_semantic(semantic)
-        results.append(save_panoptic_outputs(image_path, image, semantic, panoptic, segments, output_dir, output_crs, gsd))
+        results.append(save_panoptic_outputs(image_path, image, semantic, panoptic, segments, output_dir, output_crs, gsd, args.reference_label_root))
     (output_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")

@@ -9,8 +9,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from config import IMAGE_EXTENSIONS, TRAIN_ID_TO_COLOR, TRAIN_ID_TO_NAME
-from data import IMAGE_MEAN, IMAGE_STD
+from config import IMAGE_EXTENSIONS, LABEL_CRS_EPSG, TRAIN_ID_TO_COLOR, TRAIN_ID_TO_NAME
+from data import IMAGE_MEAN, IMAGE_STD, label_bounds, load_label
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,47 @@ def normalize_crs(value: str) -> str:
     return value.strip().upper().replace("::", ":")
 
 
-def raster_transform_for_output(image_path: Path, output_crs: str):
+def reference_label_for_image(image_path: Path, reference_label_root: str | Path | None) -> Path | None:
+    if reference_label_root is None:
+        return None
+    root = Path(reference_label_root)
+    if root.is_file():
+        if root.stem != image_path.stem:
+            raise ValueError(f"Reference label {root} does not match image stem {image_path.stem!r}.")
+        return root
+    if not root.exists():
+        raise FileNotFoundError(f"--reference-label-root does not exist: {root}")
+    matches = sorted(root.rglob(f"{image_path.stem}.json"))
+    if not matches:
+        raise FileNotFoundError(f"No reference GeoJSON label matching {image_path.stem}.json found under {root}.")
+    return matches[0]
+
+
+def transform_from_reference_label(image_path: Path, output_crs: str, reference_label_root: str | Path):
+    from affine import Affine
+    import rasterio
+
+    requested = normalize_crs(output_crs)
+    if requested != f"EPSG:{LABEL_CRS_EPSG}":
+        raise ValueError(
+            f"Reference labels are validated as EPSG:{LABEL_CRS_EPSG}, but --output-crs is {output_crs}. "
+            "Use a georeferenced raster for other output CRS values."
+        )
+    label_path = reference_label_for_image(image_path, reference_label_root)
+    if label_path is None:
+        raise ValueError(f"{image_path} has no raster CRS and no --reference-label-root was provided.")
+    label = load_label(label_path)
+    min_x, min_y, max_x, max_y = label_bounds(label, label_path)
+    with rasterio.open(image_path) as src:
+        width, height = src.width, src.height
+    if width <= 0 or height <= 0 or max_x <= min_x or max_y <= min_y:
+        raise ValueError(f"{label_path} has invalid bounds for {image_path}.")
+    x_res = (max_x - min_x) / width
+    y_res = (max_y - min_y) / height
+    return Affine(x_res, 0.0, min_x, 0.0, -y_res, max_y)
+
+
+def raster_transform_for_output(image_path: Path, output_crs: str, reference_label_root: str | Path | None = None):
     try:
         import rasterio
         from rasterio.errors import NotGeoreferencedWarning
@@ -64,7 +104,12 @@ def raster_transform_for_output(image_path: Path, output_crs: str):
         warnings.simplefilter("ignore", NotGeoreferencedWarning)
         with rasterio.open(image_path) as src:
             if src.crs is None:
-                raise ValueError(f"{image_path} has no raster CRS. Cannot write GeoJSON coordinates for {output_crs}.")
+                if reference_label_root is not None:
+                    return transform_from_reference_label(image_path, output_crs, reference_label_root)
+                raise ValueError(
+                    f"{image_path} has no raster CRS. Cannot write GeoJSON coordinates for {output_crs}. "
+                    "Provide georeferenced TIFFs or pass --reference-label-root pointing to matching EPSG:5186 GeoJSON labels."
+                )
             src_crs = src.crs
             requested = normalize_crs(output_crs)
             requested_epsg = requested.removeprefix("EPSG:")
@@ -214,10 +259,11 @@ def polygonize_panoptic(
     image_path: Path,
     output_crs: str,
     gsd: GsdConfig,
+    reference_label_root: str | Path | None = None,
 ) -> dict[str, object]:
     from rasterio.features import shapes
 
-    transform = raster_transform_for_output(image_path, output_crs)
+    transform = raster_transform_for_output(image_path, output_crs, reference_label_root)
     by_id = {int(segment["id"]): segment for segment in segments}
     features: list[dict[str, object]] = []
     for geometry, value in shapes(panoptic.astype(np.int32), mask=panoptic > 0, transform=transform):
@@ -252,6 +298,7 @@ def save_panoptic_outputs(
     output_dir: Path,
     output_crs: str,
     gsd: GsdConfig,
+    reference_label_root: str | Path | None = None,
 ) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     mask_path = output_dir / f"{image_path.stem}_semantic_mask.png"
@@ -263,7 +310,7 @@ def save_panoptic_outputs(
     colorize_mask(semantic).save(color_path)
     panoptic_id_to_rgb(panoptic.astype(np.int32)).save(panoptic_path)
     save_overlay(image, semantic, overlay_path)
-    geojson = polygonize_panoptic(panoptic, segments, image_path, output_crs, gsd)
+    geojson = polygonize_panoptic(panoptic, segments, image_path, output_crs, gsd, reference_label_root)
     geojson_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
     return {
         "image": str(image_path),

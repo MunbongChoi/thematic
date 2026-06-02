@@ -64,5 +64,5 @@ def run_inference(args) -> None:
                     }
                 )
                 next_segment_id += 1
-        results.append(save_panoptic_outputs(image_path, image, semantic, panoptic, segments, output_dir, output_crs, gsd))
+        results.append(save_panoptic_outputs(image_path, image, semantic, panoptic, segments, output_dir, output_crs, gsd, args.reference_label_root))
     (output_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")

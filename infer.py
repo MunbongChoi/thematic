@@ -23,6 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", required=True, help="Input TIFF image file or directory.")
     parser.add_argument("--output-dir", default="outputs/infer")
     parser.add_argument("--output-crs", default=None, help="Required GeoJSON coordinate CRS, for example EPSG:5186.")
+    parser.add_argument(
+        "--reference-label-root",
+        default=None,
+        help="Optional GeoJSON label file/root used to recover coordinates when input TIFFs have no raster CRS.",
+    )
     parser.add_argument("--gsd-m", type=float, default=None, help="Square-pixel GSD in meters. Enables area_m2.")
     parser.add_argument("--gsd-x-m", type=float, default=None, help="Horizontal GSD in meters for non-square pixels.")
     parser.add_argument("--gsd-y-m", type=float, default=None, help="Vertical GSD in meters for non-square pixels.")
