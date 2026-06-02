@@ -68,6 +68,18 @@ def reference_label_for_image(image_path: Path, reference_label_root: str | Path
     return matches[0]
 
 
+def infer_reference_label_root(image_path: Path) -> Path | None:
+    parts = image_path.parts
+    lowered = [part.lower() for part in parts]
+    if "image" not in lowered:
+        return None
+    image_idx = len(lowered) - 1 - lowered[::-1].index("image")
+    if image_idx == 0:
+        return None
+    candidate = Path(*parts[:image_idx]) / "label"
+    return candidate if candidate.exists() else None
+
+
 def transform_from_reference_label(image_path: Path, output_crs: str, reference_label_root: str | Path):
     from affine import Affine
     import rasterio
@@ -104,11 +116,13 @@ def raster_transform_for_output(image_path: Path, output_crs: str, reference_lab
         warnings.simplefilter("ignore", NotGeoreferencedWarning)
         with rasterio.open(image_path) as src:
             if src.crs is None:
+                reference_label_root = reference_label_root or infer_reference_label_root(image_path)
                 if reference_label_root is not None:
                     return transform_from_reference_label(image_path, output_crs, reference_label_root)
                 raise ValueError(
                     f"{image_path} has no raster CRS. Cannot write GeoJSON coordinates for {output_crs}. "
-                    "Provide georeferenced TIFFs or pass --reference-label-root pointing to matching EPSG:5186 GeoJSON labels."
+                    "Provide georeferenced TIFFs or pass --reference-label-root pointing to matching EPSG:5186 GeoJSON labels. "
+                    "For the default dataset layout, expected a sibling label folder such as dataset/test/label."
                 )
             src_crs = src.crs
             requested = normalize_crs(output_crs)
