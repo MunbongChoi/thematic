@@ -5,9 +5,10 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 from config import MODEL_ID_TO_NAME, MODEL_ID_TO_TRAIN_ID
-from infer_common import mask_bbox, parse_gsd_args, require_output_crs, save_panoptic_outputs
+from infer_common import iter_images, mask_bbox, parse_gsd_args, require_output_crs, save_panoptic_outputs
 from model.YOLO26.model import build_yolo_model
 
 
@@ -17,19 +18,21 @@ def run_inference(args) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     model = build_yolo_model(args.checkpoint)
+    images = iter_images(Path(args.input))
     predict_kwargs = {
-        "source": args.input,
         "task": "segment",
         "imgsz": args.image_size,
         "conf": args.threshold,
-        "stream": False,
         "verbose": False,
     }
     if args.device:
         predict_kwargs["device"] = args.device
-    predictions = model.predict(**predict_kwargs)
     results: list[dict[str, object]] = []
-    for result in predictions:
+    for source_image in tqdm(images, desc="infer-yolo26"):
+        predictions = model.predict(source=str(source_image), stream=False, **predict_kwargs)
+        if len(predictions) != 1:
+            raise RuntimeError(f"Expected one YOLO prediction for {source_image}, got {len(predictions)}.")
+        result = predictions[0]
         image_path = Path(result.path)
         if image_path.suffix.lower() not in {".tif", ".tiff"}:
             raise ValueError(f"YOLO inference output came from unsupported input {image_path}. Expected .tif or .tiff.")
