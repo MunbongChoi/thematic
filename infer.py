@@ -33,6 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gsd-y-m", type=float, default=None, help="Vertical GSD in meters for non-square pixels.")
     parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument("--threshold", type=float, default=0.25, help="YOLO confidence threshold.")
+    parser.add_argument("--tile-size", type=int, default=0, help="Enable high-resolution tiled inference with this tile size. Use 0 for whole-image inference.")
+    parser.add_argument("--tile-overlap", type=int, default=128, help="Pixel overlap between inference tiles.")
     parser.add_argument("--device", default=None)
     parser.add_argument("--samgeo-model-type", default=DEFAULT_SAMGEO_MODEL_TYPE, help="segment-geospatial SamGeo model_type.")
     parser.add_argument("--samgeo-checkpoint", default=None, help="Optional local SAM checkpoint for segment-geospatial.")

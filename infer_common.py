@@ -4,6 +4,7 @@ import json
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 import torch
@@ -23,6 +24,28 @@ class GsdConfig:
         return self.x_m is not None and self.y_m is not None
 
 
+@dataclass(frozen=True)
+class TileConfig:
+    size: int = 0
+    overlap: int = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.size > 0
+
+
+@dataclass(frozen=True)
+class TileWindow:
+    box: tuple[int, int, int, int]
+    write_box: tuple[int, int, int, int]
+
+    @property
+    def relative_write_box(self) -> tuple[int, int, int, int]:
+        left, top, _, _ = self.box
+        write_left, write_top, write_right, write_bottom = self.write_box
+        return write_left - left, write_top - top, write_right - left, write_bottom - top
+
+
 def parse_gsd_args(args) -> GsdConfig:
     gsd_m = getattr(args, "gsd_m", None)
     gsd_x_m = getattr(args, "gsd_x_m", None)
@@ -40,6 +63,55 @@ def parse_gsd_args(args) -> GsdConfig:
     if gsd_x_m <= 0 or gsd_y_m <= 0:
         raise ValueError("--gsd-x-m and --gsd-y-m must be positive.")
     return GsdConfig(float(gsd_x_m), float(gsd_y_m))
+
+
+def parse_tile_args(args) -> TileConfig:
+    tile_size = int(getattr(args, "tile_size", 0) or 0)
+    tile_overlap = int(getattr(args, "tile_overlap", 0) or 0)
+    if tile_size <= 0:
+        return TileConfig()
+    if tile_size < 64:
+        raise ValueError("--tile-size must be at least 64 pixels when enabled.")
+    if tile_overlap < 0:
+        raise ValueError("--tile-overlap must be non-negative.")
+    if tile_overlap >= tile_size:
+        raise ValueError("--tile-overlap must be smaller than --tile-size.")
+    return TileConfig(tile_size, tile_overlap)
+
+
+def should_use_tiles(image: Image.Image, tile_config: TileConfig) -> bool:
+    return tile_config.enabled and (image.width > tile_config.size or image.height > tile_config.size)
+
+
+def _tile_starts(length: int, tile_size: int, stride: int) -> list[int]:
+    if length <= tile_size:
+        return [0]
+    starts = list(range(0, max(1, length - tile_size + 1), stride))
+    final = length - tile_size
+    if starts[-1] != final:
+        starts.append(final)
+    return starts
+
+
+def iter_tile_windows(width: int, height: int, tile_config: TileConfig) -> Iterator[TileWindow]:
+    if not tile_config.enabled:
+        yield TileWindow((0, 0, width, height), (0, 0, width, height))
+        return
+    tile_size = tile_config.size
+    overlap = tile_config.overlap
+    stride = tile_size - overlap
+    trim = overlap // 2
+    xs = _tile_starts(width, tile_size, stride)
+    ys = _tile_starts(height, tile_size, stride)
+    for top in ys:
+        for left in xs:
+            right = min(left + tile_size, width)
+            bottom = min(top + tile_size, height)
+            write_left = left if left == 0 else min(right, left + trim)
+            write_top = top if top == 0 else min(bottom, top + trim)
+            write_right = right if right == width else max(write_left, right - trim)
+            write_bottom = bottom if bottom == height else max(write_top, bottom - trim)
+            yield TileWindow((left, top, right, bottom), (write_left, write_top, write_right, write_bottom))
 
 
 def require_output_crs(value: str | None) -> str:
