@@ -17,6 +17,7 @@ from tqdm import tqdm
 from config import BACKGROUND_ID, DEFAULT_IMAGE_SIZE, DEFAULT_SEED, OUTPUT_ROOT, PREPARED_ROOT, TRAIN_ID_TO_NAME
 from data import SemanticSegmentationDataset, collate_semantic, ensure_dir, seed_everything, split_samples
 from model.UNet.model import ModelAPI
+from model.UNet.train import amp_is_enabled, autocast_context, make_grad_scaler, semantic_loss
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +31,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4, help="Per-GPU batch size.")
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True, help="Enable AMP when CUDA is available.")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping max norm. Use 0 to disable.")
+    parser.add_argument("--unet-ce-weight", type=float, default=1.0, help="Cross-entropy loss weight.")
+    parser.add_argument("--unet-dice-weight", type=float, default=0.5, help="Foreground Dice loss weight.")
+    parser.add_argument("--unet-scheduler", default="cosine", choices=["none", "cosine"], help="Learning-rate scheduler.")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers per GPU process.")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--limit", type=int, default=None)
@@ -82,10 +88,12 @@ def make_ddp_loaders(args: argparse.Namespace, rank: int, world_size: int) -> tu
     )
 
 
-def add_metric_stats(stats: torch.Tensor, logits: torch.Tensor, labels: torch.Tensor, loss: torch.Tensor) -> None:
+def add_metric_stats(stats: torch.Tensor, logits: torch.Tensor, labels: torch.Tensor, loss: torch.Tensor, loss_parts: dict[str, float]) -> None:
     preds = logits.argmax(dim=1)
     iou_sum = 0.0
     iou_count = 0
+    dice_sum = 0.0
+    dice_count = 0
     for class_id in TRAIN_ID_TO_NAME:
         if class_id == BACKGROUND_ID:
             continue
@@ -95,6 +103,10 @@ def add_metric_stats(stats: torch.Tensor, logits: torch.Tensor, labels: torch.Te
         if union:
             iou_sum += float((pred & target).sum().item() / union)
             iou_count += 1
+        dice_denominator = pred.sum().item() + target.sum().item()
+        if dice_denominator:
+            dice_sum += float((2.0 * (pred & target).sum().item()) / dice_denominator)
+            dice_count += 1
     stats[0] += float(loss.detach())
     stats[1] += 1.0
     stats[2] += iou_sum
@@ -103,6 +115,10 @@ def add_metric_stats(stats: torch.Tensor, logits: torch.Tensor, labels: torch.Te
     total = float(labels.numel())
     stats[4] += correct
     stats[5] += total
+    stats[6] += float(loss_parts["ce_loss"])
+    stats[7] += float(loss_parts["dice_loss"])
+    stats[8] += dice_sum
+    stats[9] += float(dice_count)
 
 
 def reduce_stats(stats: torch.Tensor) -> dict[str, float]:
@@ -111,6 +127,9 @@ def reduce_stats(stats: torch.Tensor) -> dict[str, float]:
         "loss": float(stats[0].item() / max(1.0, stats[1].item())),
         "mean_iou": float(stats[2].item() / max(1.0, stats[3].item())),
         "pixel_accuracy": float(stats[4].item() / max(1.0, stats[5].item())),
+        "ce_loss": float(stats[6].item() / max(1.0, stats[1].item())),
+        "dice_loss": float(stats[7].item() / max(1.0, stats[1].item())),
+        "foreground_dice": float(stats[8].item() / max(1.0, stats[9].item())),
     }
 
 
@@ -119,26 +138,42 @@ def run_epoch(
     loader: DataLoader,
     device: torch.device,
     rank: int,
+    args: argparse.Namespace,
     optimizer: torch.optim.Optimizer | None = None,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
-    stats = torch.zeros((6,), dtype=torch.float64, device=device)
+    stats = torch.zeros((10,), dtype=torch.float64, device=device)
     context = torch.enable_grad() if is_train else torch.inference_mode()
+    use_amp = amp_is_enabled(args, device)
     with context:
         progress = tqdm(loader, leave=False, disable=rank != 0)
         for batch in progress:
             images = batch["pixel_values"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            logits = model(images)
-            if logits.shape[-2:] != labels.shape[-2:]:
-                logits = F.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
-            loss = F.cross_entropy(logits, labels)
+            with autocast_context(device, use_amp):
+                logits = model(images)
+                if logits.shape[-2:] != labels.shape[-2:]:
+                    logits = F.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+                loss, loss_parts = semantic_loss(logits, labels, args)
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-            add_metric_stats(stats, logits.detach(), labels.detach(), loss)
+                if scaler is not None and scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    grad_clip = float(getattr(args, "grad_clip", 0.0) or 0.0)
+                    if grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    grad_clip = float(getattr(args, "grad_clip", 0.0) or 0.0)
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
+            add_metric_stats(stats, logits.detach(), labels.detach(), loss, loss_parts)
     return reduce_stats(stats)
 
 
@@ -157,13 +192,19 @@ def main() -> None:
             output_device=local_rank if device.type == "cuda" else None,
         )
         optimizer = torch.optim.AdamW(ddp_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = (
+            torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+            if args.unet_scheduler == "cosine"
+            else None
+        )
+        scaler = make_grad_scaler(amp_is_enabled(args, device))
         best_value = -float("inf")
         history: list[dict[str, object]] = []
         for epoch in range(1, args.epochs + 1):
             train_sampler.set_epoch(epoch)
-            train_metrics = run_epoch(ddp_model, train_loader, device, rank, optimizer)
-            valid_metrics = run_epoch(ddp_model, valid_loader, device, rank, None)
-            row = {"epoch": epoch, "train": train_metrics, "valid": valid_metrics}
+            train_metrics = run_epoch(ddp_model, train_loader, device, rank, args, optimizer, scaler)
+            valid_metrics = run_epoch(ddp_model, valid_loader, device, rank, args, None, None)
+            row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"], "train": train_metrics, "valid": valid_metrics}
             if rank == 0:
                 history.append(row)
                 print(json.dumps(row, indent=2))
@@ -172,6 +213,8 @@ def main() -> None:
                 if valid_metrics["mean_iou"] > best_value:
                     best_value = valid_metrics["mean_iou"]
                     model_api.save(arch_output_dir / "best.pt", args.image_size, valid_metrics)
+            if scheduler is not None:
+                scheduler.step()
         if rank == 0:
             (arch_output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     finally:

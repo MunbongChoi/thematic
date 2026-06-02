@@ -95,6 +95,7 @@ def save_checkpoint(
             "architecture": str(payload["architecture"]),
             "model_name_or_path": payload.get("model_name_or_path"),
             "num_labels": payload.get("num_labels"),
+            "model_config": payload,
             "image_size": image_size,
             "state_dict": model_to_save.state_dict(),
             "semantic_id2label": TRAIN_ID_TO_NAME,
@@ -132,11 +133,17 @@ def resolve_checkpoint_path(path: str | Path) -> Path:
 def build_model_for_checkpoint(checkpoint: dict[str, Any]) -> nn.Module:
     architecture = str(checkpoint["architecture"]).strip().lower()
     if architecture == "unet":
-        from model.UNet.model import UNetConfig, build_model
+        from model.UNet.model import DEFAULT_UNET_MODEL, UNetConfig, build_model, _normalize_variant
 
+        payload = checkpoint.get("model_config") or {}
+        model_name = checkpoint.get("model_name_or_path")
+        variant = payload.get("variant") or _normalize_variant(str(model_name or DEFAULT_UNET_MODEL))
         config = UNetConfig(
-            model_name_or_path=checkpoint.get("model_name_or_path"),
+            model_name_or_path=model_name,
             num_labels=int(checkpoint.get("num_labels") or NUM_SEMANTIC_CLASSES),
+            base_channels=int(payload.get("base_channels") or (32 if variant == "unet-basic" else 48)),
+            dropout=float(payload.get("dropout") or 0.0 if variant == "unet-basic" else payload.get("dropout", 0.1)),
+            variant=str(variant),
         )
         return build_model(config)
     if architecture == "mask2former":
