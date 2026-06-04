@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5, help="YOLO confidence threshold.")
     parser.add_argument("--min-mask-area-px", type=int, default=256, help="Drop predicted instances smaller than this pixel area.")
     parser.add_argument("--max-mask-overlap", type=float, default=0.35, help="Drop a predicted instance when this fraction is already covered by higher-confidence masks.")
+    parser.add_argument("--min-segment-score", type=float, default=0.0, help="Drop Mask2Former panoptic segments below this score.")
     parser.add_argument("--tile-size", type=int, default=0, help="Enable high-resolution tiled inference with this tile size. Use 0 for whole-image inference.")
     parser.add_argument("--tile-overlap", type=int, default=128, help="Pixel overlap between inference tiles.")
     parser.add_argument("--device", default=None)

@@ -72,6 +72,7 @@ MODEL_ID_TO_TRAIN_ID = {item.model_id: item.train_id for item in CLASSES}
 
 TRAIN_ID_TO_NAME = {BACKGROUND_ID: "background"} | {item.train_id: item.name for item in CLASSES}
 TRAIN_ID_TO_COLOR = {BACKGROUND_ID: (0, 0, 0)} | {item.train_id: item.color for item in CLASSES}
+TRAIN_ID_TO_IS_THING = {BACKGROUND_ID: False} | {item.train_id: item.isthing for item in CLASSES}
 
 MODEL_ID_TO_NAME = {item.model_id: item.name for item in CLASSES}
 MODEL_NAME_TO_ID = {item.name: item.model_id for item in CLASSES}

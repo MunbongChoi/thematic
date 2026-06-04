@@ -58,6 +58,6 @@ def run_inference(args, model: torch.nn.Module, checkpoint: dict, device: torch.
             semantic = predict_semantic_tiled(model, image, image_size, device, tile_config)
         else:
             semantic = predict_semantic(model, image, image_size, device)
-        panoptic, segments = panoptic_from_semantic(semantic)
+        panoptic, segments = panoptic_from_semantic(semantic, min_area_px=int(getattr(args, "min_mask_area_px", 0) or 0), split_stuff=False)
         results.append(save_panoptic_outputs(image_path, image, semantic, panoptic, segments, output_dir, output_crs, gsd, args.reference_label_root))
     (output_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")

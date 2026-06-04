@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from config import IMAGE_EXTENSIONS, LABEL_CRS_EPSG, TRAIN_ID_TO_COLOR, TRAIN_ID_TO_NAME
+from config import IMAGE_EXTENSIONS, LABEL_CRS_EPSG, TRAIN_ID_TO_COLOR, TRAIN_ID_TO_IS_THING, TRAIN_ID_TO_NAME
 from data import IMAGE_MEAN, IMAGE_STD, label_bounds, load_label
 
 
@@ -294,14 +294,17 @@ def connected_components(binary: np.ndarray) -> list[np.ndarray]:
     return components
 
 
-def panoptic_from_semantic(mask: np.ndarray) -> tuple[np.ndarray, list[dict[str, object]]]:
+def panoptic_from_semantic(mask: np.ndarray, min_area_px: int = 0, split_stuff: bool = False) -> tuple[np.ndarray, list[dict[str, object]]]:
     panoptic = np.zeros(mask.shape, dtype=np.int32)
     segments: list[dict[str, object]] = []
     next_segment_id = 1
     for train_id in sorted(int(value) for value in np.unique(mask) if int(value) != 0):
-        for component in connected_components(mask == train_id):
+        class_mask = mask == train_id
+        is_thing = bool(TRAIN_ID_TO_IS_THING.get(train_id, False))
+        components = connected_components(class_mask) if is_thing or split_stuff else [class_mask]
+        for component in components:
             area_px = int(component.sum())
-            if area_px == 0:
+            if area_px < min_area_px:
                 continue
             panoptic[component] = next_segment_id
             segments.append(
@@ -310,6 +313,8 @@ def panoptic_from_semantic(mask: np.ndarray) -> tuple[np.ndarray, list[dict[str,
                     "category_id": train_id,
                     "train_id": train_id,
                     "class_name": TRAIN_ID_TO_NAME.get(train_id, str(train_id)),
+                    "isthing": is_thing,
+                    "source": "semantic_pseudo_panoptic",
                     "area_px": area_px,
                     "bbox": mask_bbox(component),
                 }
@@ -351,11 +356,24 @@ def polygonize_panoptic(
 
     transform = raster_transform_for_output(image_path, output_crs, reference_label_root)
     by_id = {int(segment["id"]): segment for segment in segments}
-    features: list[dict[str, object]] = []
+    geometries_by_id: dict[int, list[dict[str, object]]] = {}
     for geometry, value in shapes(panoptic.astype(np.int32), mask=panoptic > 0, transform=transform):
-        segment = by_id.get(int(value))
-        if segment is None:
+        segment_id = int(value)
+        if segment_id not in by_id:
             continue
+        geometries_by_id.setdefault(segment_id, []).append(geometry)
+    features: list[dict[str, object]] = []
+    for segment_id, geometries in geometries_by_id.items():
+        segment = by_id.get(segment_id)
+        if segment is None or not geometries:
+            continue
+        if len(geometries) == 1:
+            geometry = geometries[0]
+        else:
+            geometry = {
+                "type": "MultiPolygon",
+                "coordinates": [item["coordinates"] for item in geometries if item.get("type") == "Polygon"],
+            }
         features.append(
             {
                 "type": "Feature",
